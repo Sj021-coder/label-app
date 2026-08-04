@@ -7,14 +7,14 @@ export default async function DashboardLayout({ children }) {
   const {
     data: { user },
   } = await supabase.auth.getUser();
-  if (!user) redirect("/login");
+  if (!user) redirect("/");
 
   const { data: profile } = await supabase
     .from("profiles")
     .select("username")
     .eq("id", user.id)
     .single();
-  if (!profile) redirect("/onboarding");
+  if (!profile) redirect("/");
 
   const { data: myRoster } = await supabase
     .from("roster_entries")

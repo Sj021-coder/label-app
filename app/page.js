@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
+import DraftOnboarding from "./DraftOnboarding";
 
 export default async function Home() {
   const supabase = await createClient();
@@ -7,15 +8,19 @@ export default async function Home() {
     data: { user },
   } = await supabase.auth.getUser();
 
-  if (!user) redirect("/login");
+  if (user) {
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("id", user.id)
+      .single();
+    if (profile) redirect("/roster");
+  }
 
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("id")
-    .eq("id", user.id)
-    .single();
+  const { data: artists } = await supabase
+    .from("artists")
+    .select("id, name, initials, color, score")
+    .order("name");
 
-  if (!profile) redirect("/onboarding");
-
-  redirect("/roster");
+  return <DraftOnboarding artists={artists || []} />;
 }
