@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { SCORING_EVENTS } from "@/lib/scoringEvents";
+import { computeWeightedScore } from "@/lib/gameRules";
 
 export async function POST(request) {
   const supabase = await createClient();
@@ -12,20 +13,25 @@ export async function POST(request) {
   }
 
   const body = await request.json();
-  const { artistId, eventKey, customDelta, reason } = body;
+  const { artistId, eventKey, customDelta, customCategory, reason } = body;
 
   const eventDef = SCORING_EVENTS.find((e) => e.key === eventKey);
   if (!eventDef) {
     return NextResponse.json({ error: "Unknown event key" }, { status: 400 });
   }
 
-  const delta = eventKey === "custom" ? Number(customDelta) || 0 : eventDef.delta;
-  const label = eventKey === "custom" ? reason || "Custom adjustment" : eventDef.label;
+  const isCustom = eventKey === "custom";
+  const delta = isCustom ? Number(customDelta) || 0 : eventDef.delta;
+  const label = isCustom ? reason || "Custom adjustment" : eventDef.label;
+  const category = isCustom ? customCategory : eventDef.category;
 
-  // fetch current score
+  if (!["momentum", "performance", "activity", "culture"].includes(category)) {
+    return NextResponse.json({ error: "Invalid or missing category" }, { status: 400 });
+  }
+
   const { data: artist, error: fetchErr } = await supabase
     .from("artists")
-    .select("id, score")
+    .select("id, momentum_score, performance_score, activity_score, culture_score")
     .eq("id", artistId)
     .single();
 
@@ -33,22 +39,39 @@ export async function POST(request) {
     return NextResponse.json({ error: "Artist not found" }, { status: 404 });
   }
 
-  const newScore = artist.score + delta;
+  const updatedSubtotals = {
+    momentum_score: artist.momentum_score,
+    performance_score: artist.performance_score,
+    activity_score: artist.activity_score,
+    culture_score: artist.culture_score,
+  };
+  updatedSubtotals[`${category}_score`] += delta;
+
+  const newScore = computeWeightedScore(updatedSubtotals);
 
   const { error: updateErr } = await supabase
     .from("artists")
-    .update({ score: newScore })
+    .update({ ...updatedSubtotals, score: newScore })
     .eq("id", artistId);
 
   if (updateErr) {
     return NextResponse.json({ error: updateErr.message }, { status: 500 });
   }
 
+  // Tag the event with the current active season, if one exists
+  const { data: activeSeason } = await supabase
+    .from("seasons")
+    .select("id")
+    .eq("is_active", true)
+    .single();
+
   const { error: logErr } = await supabase.from("score_events").insert({
     artist_id: artistId,
     event_key: eventKey,
     label,
     delta,
+    category,
+    season_id: activeSeason?.id || null,
     created_by: user.id,
   });
 

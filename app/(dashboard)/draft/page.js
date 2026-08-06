@@ -9,12 +9,13 @@ export default async function DraftPage() {
 
   const { data: artists } = await supabase
     .from("artists")
-    .select("id, name, initials, color, score")
+    .select("id, name, initials, color, score, cost, tier")
+    .order("tier")
     .order("name");
 
   const { data: rosterRows } = await supabase
     .from("roster_entries")
-    .select("artist_id")
+    .select("artist_id, artists(id, cost, tier)")
     .eq("user_id", user.id);
 
   const rosterIds = (rosterRows || []).map((r) => r.artist_id);

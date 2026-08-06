@@ -3,12 +3,13 @@
 import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
-import { SCORING_EVENTS } from "@/lib/scoringEvents";
+import { SCORING_EVENTS, CATEGORIES } from "@/lib/scoringEvents";
 
 export default function AdminForm({ artists }) {
   const [artistId, setArtistId] = useState(artists[0]?.id || "");
   const [eventKey, setEventKey] = useState(SCORING_EVENTS[0].key);
   const [customDelta, setCustomDelta] = useState(0);
+  const [customCategory, setCustomCategory] = useState(CATEGORIES[0].key);
   const [reason, setReason] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -20,7 +21,7 @@ export default function AdminForm({ artists }) {
     if (!artistId) return;
     const { data } = await supabase
       .from("score_events")
-      .select("id, label, delta, created_at")
+      .select("id, label, delta, category, created_at")
       .eq("artist_id", artistId)
       .order("created_at", { ascending: false })
       .limit(10);
@@ -33,6 +34,7 @@ export default function AdminForm({ artists }) {
 
   const isCustom = eventKey === "custom";
   const currentArtist = artists.find((a) => a.id === artistId);
+  const selectedEvent = SCORING_EVENTS.find((e) => e.key === eventKey);
 
   async function handleApply() {
     setError("");
@@ -40,7 +42,7 @@ export default function AdminForm({ artists }) {
     const res = await fetch("/api/score-event", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ artistId, eventKey, customDelta, reason }),
+      body: JSON.stringify({ artistId, eventKey, customDelta, customCategory, reason }),
     });
     setLoading(false);
     if (!res.ok) {
@@ -89,10 +91,31 @@ export default function AdminForm({ artists }) {
             </option>
           ))}
         </select>
+        {!isCustom && selectedEvent && (
+          <p className="text-[11px] text-[var(--text-faint)] mt-1">
+            Catégorie : {selectedEvent.category}
+          </p>
+        )}
       </div>
 
       {isCustom && (
         <>
+          <div className="mb-3.5">
+            <label className="block text-[11px] uppercase tracking-wide text-[var(--text-faint)] font-bold mb-1.5">
+              Catégorie
+            </label>
+            <select
+              value={customCategory}
+              onChange={(e) => setCustomCategory(e.target.value)}
+              className="w-full bg-[var(--surface)] border border-[var(--border)] rounded-xl px-3 py-2.5 text-sm"
+            >
+              {CATEGORIES.map((c) => (
+                <option key={c.key} value={c.key}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+          </div>
           <div className="mb-3.5">
             <label className="block text-[11px] uppercase tracking-wide text-[var(--text-faint)] font-bold mb-1.5">
               Points (+/-)
@@ -143,7 +166,10 @@ export default function AdminForm({ artists }) {
               key={h.id}
               className="flex justify-between py-2 border-b border-[var(--border)] text-[13px]"
             >
-              <span className="text-[var(--text-muted)]">{h.label}</span>
+              <span className="text-[var(--text-muted)]">
+                {h.label}
+                {h.category && <span className="text-[var(--text-faint)]"> · {h.category}</span>}
+              </span>
               <span
                 className={`mono font-bold ${
                   h.delta >= 0 ? "text-[var(--gold)]" : "text-[var(--crimson)]"

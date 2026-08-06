@@ -7,7 +7,7 @@ export default async function LeaderboardPage() {
   } = await supabase.auth.getUser();
 
   const { data: rows } = await supabase
-    .from("leaderboard")
+    .from("user_totals")
     .select("*")
     .order("total_score", { ascending: false });
 
@@ -34,9 +34,14 @@ export default async function LeaderboardPage() {
           <div className="w-8 h-8 rounded-full bg-[var(--surface-2)] flex items-center justify-center text-xs font-bold flex-shrink-0">
             {r.username.slice(0, 2).toUpperCase()}
           </div>
-          <div className="flex-1 text-sm font-semibold">
-            {r.username}
-            {r.user_id === user.id ? " (toi)" : ""}
+          <div className="flex-1">
+            <div className="text-sm font-semibold">
+              {r.username}
+              {r.user_id === user.id ? " (toi)" : ""}
+            </div>
+            {r.captain_bonus > 0 && (
+              <div className="text-[10px] text-[var(--gold)]">+{r.captain_bonus} bonus capitaine</div>
+            )}
           </div>
           <div className="mono text-sm font-bold">{r.total_score} pts</div>
         </div>
