@@ -12,7 +12,7 @@ import {
   totalCost,
 } from "@/lib/gameRules";
 
-export default function DraftList({ artists, initialRosterIds }) {
+export default function DraftList({ artists, initialRosterIds, newsCounts = {} }) {
   const [rosterIds, setRosterIds] = useState(initialRosterIds);
   const [error, setError] = useState("");
   const [pending, startTransition] = useTransition();
@@ -108,7 +108,14 @@ export default function DraftList({ artists, initialRosterIds }) {
           >
             <VinylAvatar initials={a.initials} color={a.color} size={42} />
             <div className="flex-1">
-              <div className="text-sm font-bold">{a.name}</div>
+              <div className="text-sm font-bold flex items-center gap-1.5">
+                {a.name}
+                {newsCounts[a.id] > 0 && (
+                  <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-[var(--violet)] text-white">
+                    📰 {newsCounts[a.id]}
+                  </span>
+                )}
+              </div>
               <div className="flex items-center gap-2">
                 <span className="text-[10px] text-[var(--text-faint)]">{TIERS[a.tier]?.stars}</span>
                 <span className="mono text-xs text-[var(--gold)] font-bold">{a.cost}M</span>
