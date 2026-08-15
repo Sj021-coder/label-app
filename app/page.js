@@ -19,7 +19,7 @@ export default async function Home() {
 
   const { data: artists } = await supabase
     .from("artists")
-    .select("id, name, initials, color, score")
+    .select("id, name, initials, color, score, cost, tier, image_url")
     .order("name");
 
   return <DraftOnboarding artists={artists || []} />;

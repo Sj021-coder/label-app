@@ -10,7 +10,7 @@ export default async function RosterPage() {
 
   const { data: rosterRows } = await supabase
     .from("roster_entries")
-    .select("artist_id, artists(id, name, initials, color, score, cost, tier)")
+    .select("artist_id, artists(id, name, initials, color, score, cost, value, tier, image_url)")
     .eq("user_id", user.id);
 
   const roster = (rosterRows || []).map((r) => r.artists).filter(Boolean);

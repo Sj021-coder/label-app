@@ -3,7 +3,7 @@
 import { useState, useMemo } from "react";
 import { useTransition } from "react";
 import { useRouter } from "next/navigation";
-import VinylAvatar from "@/components/VinylAvatar";
+import ArtistFace from "@/components/ArtistFace";
 import {
   BUDGET_TOTAL,
   ROSTER_SIZE,
@@ -106,7 +106,13 @@ export default function DraftList({ artists, initialRosterIds, newsCounts = {} }
             key={a.id}
             className="flex items-center gap-3 bg-[var(--surface)] border border-[var(--border)] rounded-2xl px-3 py-2.5 mb-2"
           >
-            <VinylAvatar initials={a.initials} color={a.color} size={42} />
+            <ArtistFace
+              imageUrl={a.image_url}
+              initials={a.initials}
+              color={a.color}
+              name={a.name}
+              size={42}
+            />
             <div className="flex-1">
               <div className="text-sm font-bold flex items-center gap-1.5">
                 {a.name}

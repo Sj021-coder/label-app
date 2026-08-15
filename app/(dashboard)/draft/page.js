@@ -9,7 +9,7 @@ export default async function DraftPage() {
 
   const { data: artists } = await supabase
     .from("artists")
-    .select("id, name, initials, color, score, cost, tier")
+    .select("id, name, initials, color, score, cost, tier, image_url")
     .order("tier")
     .order("name");
 

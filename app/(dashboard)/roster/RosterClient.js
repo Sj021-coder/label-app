@@ -3,7 +3,6 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import VinylAvatar from "@/components/VinylAvatar";
 import { TIERS } from "@/lib/gameRules";
 
 export default function RosterClient({
@@ -67,13 +66,36 @@ export default function RosterClient({
                   C
                 </div>
               )}
-              <div className="mb-2">
-                <VinylAvatar initials={artist.initials} color={artist.color} size={"100%"} />
+              <div className="mb-2 aspect-square rounded-xl overflow-hidden bg-[var(--surface-2)]">
+                {artist.image_url ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={artist.image_url}
+                    alt={artist.name}
+                    className="w-full h-full object-cover"
+                  />
+                ) : (
+                  <div
+                    className="w-full h-full flex items-center justify-center text-xl font-extrabold"
+                    style={{ background: artist.color, color: "#1a1310" }}
+                  >
+                    {artist.initials}
+                  </div>
+                )}
               </div>
               <div className="text-xs font-bold mb-0.5 leading-tight">{artist.name}</div>
               <div className="text-[10px] text-[var(--text-faint)] mb-1">
-                {TIERS[artist.tier]?.stars} · {artist.cost}M
+                {TIERS[artist.tier]?.stars} · {artist.cost}M coût
               </div>
+              {artist.value != null && artist.value !== artist.cost && (
+                <div
+                  className={`text-[10px] font-bold mb-1 ${
+                    artist.value > artist.cost ? "text-[var(--gold)]" : "text-[var(--crimson)]"
+                  }`}
+                >
+                  {artist.value > artist.cost ? "▲" : "▼"} Valeur: {artist.value}M
+                </div>
+              )}
               <div
                 className={`text-xs font-bold mb-1.5 ${
                   artist.score >= 0 ? "text-[var(--gold)]" : "text-[var(--crimson)]"

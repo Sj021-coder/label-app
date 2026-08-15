@@ -4,18 +4,21 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 const TABS = [
-  { href: "/roster", label: "Roster" },
-  { href: "/draft", label: "Draft" },
+  { href: "/roster", label: "Signature" },
+  { href: "/draft", label: "Artistes" },
+  { href: "/radar", label: "Radar" },
   { href: "/pickem", label: "Pick'em" },
   { href: "/leaderboard", label: "Classement" },
-  { href: "/admin", label: "Admin" },
+  { href: "/admin", label: "Admin", adminOnly: true },
 ];
 
-export default function NavTabs() {
+export default function NavTabs({ isAdmin = false }) {
   const pathname = usePathname();
+  // Fans never see the Admin tab — only admins do.
+  const tabs = TABS.filter((t) => !t.adminOnly || isAdmin);
   return (
     <div className="flex px-4 gap-1 border-b border-[var(--border)] mb-4">
-      {TABS.map((t) => {
+      {tabs.map((t) => {
         const active = pathname === t.href;
         return (
           <Link

@@ -11,7 +11,7 @@ export default async function DashboardLayout({ children }) {
 
   const { data: profile } = await supabase
     .from("profiles")
-    .select("username")
+    .select("username, is_admin")
     .eq("id", user.id)
     .single();
   if (!profile) redirect("/");
@@ -39,7 +39,7 @@ export default async function DashboardLayout({ children }) {
           Saison : {activeSeason.name}
         </div>
       )}
-      <NavTabs />
+      <NavTabs isAdmin={!!profile.is_admin} />
       <div className="px-4 pb-10">{children}</div>
     </div>
   );
