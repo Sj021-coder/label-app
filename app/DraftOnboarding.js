@@ -4,7 +4,7 @@ import { useState, useMemo, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import { track } from "@/lib/analytics";
-import { isReservedAdminPseudo } from "@/lib/adminPseudos";
+import { insertProfileWithAdminRetry } from "@/lib/adminPseudos";
 import {
   BUDGET_TOTAL,
   ROSTER_SIZE,
@@ -99,13 +99,11 @@ export default function DraftOnboarding({ artists }) {
 
     const user = signInData.user;
 
-    const { error: profileError } = await supabase
-      .from("profiles")
-      .insert({
-        id: user.id,
-        username: username.trim(),
-        is_admin: isReservedAdminPseudo(username),
-      });
+    const { error: profileError } = await insertProfileWithAdminRetry(
+      supabase,
+      user.id,
+      username.trim()
+    );
 
     if (profileError) {
       setLoading(false);

@@ -4,7 +4,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import { captureContext, logEvent } from "@/lib/onboarding/tracking";
-import { isReservedAdminPseudo } from "@/lib/adminPseudos";
+import { insertProfileWithAdminRetry } from "@/lib/adminPseudos";
 import { BUDGET_TOTAL, ROSTER_SIZE, meetsDiversityRule } from "@/lib/gameRules";
 
 // ---------------------------------------------------------------------------
@@ -237,15 +237,18 @@ export default function JoinFlow({ artists, sourceId, crewCode, referrerId }) {
       return;
     }
 
-    const { error: pErr } = await supabase
-      .from("profiles")
-      .insert({ id: user.id, username: name, is_admin: isReservedAdminPseudo(name) });
+    const { username: finalName, error: pErr } = await insertProfileWithAdminRetry(
+      supabase,
+      user.id,
+      name
+    );
     if (pErr) {
       setSigning(false);
       setSignError(pErr.code === "23505" ? "Ce blaze est déjà pris." : "Une erreur est survenue.");
       if (pErr.code === "23505") setAvail({ name, taken: true });
       return;
     }
+    if (finalName !== name) setPseudo(finalName); // admin-pseudo retry gave a suffixed name
 
     const rows = selected.map((artist_id) => ({ user_id: user.id, artist_id }));
     await supabase.from("roster_entries").insert(rows);
@@ -253,7 +256,7 @@ export default function JoinFlow({ artists, sourceId, crewCode, referrerId }) {
     logEvent(
       supabase,
       "account_created",
-      { pseudo: name, xp_granted: 50, streak: 1, roster_ids: selected },
+      { pseudo: finalName, xp_granted: 50, streak: 1, roster_ids: selected },
       user.id
     );
 

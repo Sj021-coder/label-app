@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import VinylAvatar from "@/components/VinylAvatar";
 import { captureContext, logEvent } from "@/lib/onboarding/tracking";
-import { isReservedAdminPseudo } from "@/lib/adminPseudos";
+import { insertProfileWithAdminRetry } from "@/lib/adminPseudos";
 import {
   BUDGET_TOTAL,
   ROSTER_SIZE,
@@ -99,9 +99,11 @@ export default function JoinBFlow({ artists, hook, sourceId, crewCode, referrerI
     }
     const user = signInData.user;
 
-    const { error: pErr } = await supabase
-      .from("profiles")
-      .insert({ id: user.id, username: name, is_admin: isReservedAdminPseudo(name) });
+    const { username: finalName, error: pErr } = await insertProfileWithAdminRetry(
+      supabase,
+      user.id,
+      name
+    );
     if (pErr) {
       setSaving(false);
       setError(pErr.code === "23505" ? "Ce nom de label est déjà pris." : "Une erreur est survenue.");
@@ -111,9 +113,9 @@ export default function JoinBFlow({ artists, hook, sourceId, crewCode, referrerI
     const rows = selected.map((artist_id) => ({ user_id: user.id, artist_id }));
     await supabase.from("roster_entries").insert(rows);
 
-    log("account_created", { pseudo: name, start_value: spent, roster_ids: selected }, user.id);
+    log("account_created", { pseudo: finalName, start_value: spent, roster_ids: selected }, user.id);
 
-    setSavedName(name);
+    setSavedName(finalName);
     setSaving(false);
     setPage(5);
     setTimeout(() => {

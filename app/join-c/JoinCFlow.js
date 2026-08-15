@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import ArtistFace from "@/components/ArtistFace";
 import { captureContext, logEvent } from "@/lib/onboarding/tracking";
-import { isReservedAdminPseudo } from "@/lib/adminPseudos";
+import { insertProfileWithAdminRetry } from "@/lib/adminPseudos";
 import { BUDGET_TOTAL } from "@/lib/gameRules";
 
 const VARIANT = "phase1-c";
@@ -241,11 +241,11 @@ export default function JoinCFlow({ artists, sourceId, crewCode, referrerId }) {
       setError("Connexion impossible. Réessaie.");
       return;
     }
-    const { error: pErr } = await supabase.from("profiles").insert({
-      id: user.id,
-      username: chosenHandle,
-      is_admin: isReservedAdminPseudo(chosenHandle),
-    });
+    const { username: finalHandleValue, error: pErr } = await insertProfileWithAdminRetry(
+      supabase,
+      user.id,
+      chosenHandle
+    );
     if (pErr) {
       setSaving(false);
       if (pErr.code === "23505") {
@@ -255,8 +255,12 @@ export default function JoinCFlow({ artists, sourceId, crewCode, referrerId }) {
       return;
     }
     await supabase.from("roster_entries").insert(selected.map((artist_id) => ({ user_id: user.id, artist_id })));
-    log("signup_complete", { pseudo: chosenHandle, points: backtest?.points, roster_ids: selected }, user.id);
-    setFinalHandle(chosenHandle);
+    log(
+      "signup_complete",
+      { pseudo: finalHandleValue, points: backtest?.points, roster_ids: selected },
+      user.id
+    );
+    setFinalHandle(finalHandleValue);
     setSaving(false);
     setScreen(8);
   }
