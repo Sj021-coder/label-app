@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import VinylAvatar from "@/components/VinylAvatar";
 import { captureContext, logEvent } from "@/lib/onboarding/tracking";
+import { isReservedAdminPseudo } from "@/lib/adminPseudos";
 import {
   BUDGET_TOTAL,
   ROSTER_SIZE,
@@ -98,7 +99,9 @@ export default function JoinBFlow({ artists, hook, sourceId, crewCode, referrerI
     }
     const user = signInData.user;
 
-    const { error: pErr } = await supabase.from("profiles").insert({ id: user.id, username: name });
+    const { error: pErr } = await supabase
+      .from("profiles")
+      .insert({ id: user.id, username: name, is_admin: isReservedAdminPseudo(name) });
     if (pErr) {
       setSaving(false);
       setError(pErr.code === "23505" ? "Ce nom de label est déjà pris." : "Une erreur est survenue.");

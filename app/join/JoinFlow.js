@@ -4,6 +4,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import { captureContext, logEvent } from "@/lib/onboarding/tracking";
+import { isReservedAdminPseudo } from "@/lib/adminPseudos";
 import { BUDGET_TOTAL, ROSTER_SIZE, meetsDiversityRule } from "@/lib/gameRules";
 
 // ---------------------------------------------------------------------------
@@ -236,7 +237,9 @@ export default function JoinFlow({ artists, sourceId, crewCode, referrerId }) {
       return;
     }
 
-    const { error: pErr } = await supabase.from("profiles").insert({ id: user.id, username: name });
+    const { error: pErr } = await supabase
+      .from("profiles")
+      .insert({ id: user.id, username: name, is_admin: isReservedAdminPseudo(name) });
     if (pErr) {
       setSigning(false);
       setSignError(pErr.code === "23505" ? "Ce blaze est déjà pris." : "Une erreur est survenue.");

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import ArtistFace from "@/components/ArtistFace";
 import { captureContext, logEvent } from "@/lib/onboarding/tracking";
+import { isReservedAdminPseudo } from "@/lib/adminPseudos";
 import { BUDGET_TOTAL } from "@/lib/gameRules";
 
 const VARIANT = "phase1-c";
@@ -240,7 +241,11 @@ export default function JoinCFlow({ artists, sourceId, crewCode, referrerId }) {
       setError("Connexion impossible. Réessaie.");
       return;
     }
-    const { error: pErr } = await supabase.from("profiles").insert({ id: user.id, username: chosenHandle });
+    const { error: pErr } = await supabase.from("profiles").insert({
+      id: user.id,
+      username: chosenHandle,
+      is_admin: isReservedAdminPseudo(chosenHandle),
+    });
     if (pErr) {
       setSaving(false);
       if (pErr.code === "23505") {
