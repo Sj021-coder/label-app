@@ -127,6 +127,54 @@ async function getArtistNews(name) {
   return items;
 }
 
+// --- Booska-P (French rap media) — a real, free, no-key RSS feed. ---
+// This is the honest substitute for "Instagram rap-news accounts": those
+// aren't reachable via any free API (Instagram doesn't expose arbitrary
+// third-party accounts to outside apps), but Booska-P is one of the actual
+// outlets that content like that is usually sourced from in the first place.
+function parseRssItems(xml, max) {
+  const items = [];
+  const blocks = xml.split("<item>").slice(1);
+  for (const block of blocks.slice(0, max)) {
+    const title = (block.match(/<title>(.*?)<\/title>/s) || [])[1];
+    const link = (block.match(/<link>(.*?)<\/link>/s) || [])[1];
+    const pubDate = (block.match(/<pubDate>(.*?)<\/pubDate>/s) || [])[1];
+    if (title && link) {
+      items.push({
+        title: title.replace(/<!\[CDATA\[|\]\]>/g, "").trim(),
+        url: link.trim(),
+        published_at: pubDate ? new Date(pubDate).toISOString() : null,
+      });
+    }
+  }
+  return items;
+}
+
+async function getBooskaPArtistNews(artistName) {
+  // Booska-P's own search is fuzzy (verified: it returns loosely-related
+  // results, not just exact matches — the same relevance risk that got
+  // Currents API dropped). So we search, then keep only items whose TITLE
+  // actually contains the artist's name — a cheap but real relevance filter.
+  const url = `https://www.booska-p.com/?s=${encodeURIComponent(artistName)}&feed=rss2`;
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const xml = await res.text();
+  const nameLc = artistName.toLowerCase();
+  return parseRssItems(xml, 10)
+    .filter((i) => i.title.toLowerCase().includes(nameLc))
+    .slice(0, 3)
+    .map((i) => ({ ...i, source: "Booska-P" }));
+}
+
+async function getGeneralRapNews() {
+  // The site's whole feed, unfiltered — a general "actu rap" ticker, not
+  // tied to any one artist. Feeds the Radar's holistic feel.
+  const res = await fetch("https://www.booska-p.com/feed/");
+  if (!res.ok) return [];
+  const xml = await res.text();
+  return parseRssItems(xml, 8).map((i) => ({ ...i, source: "Booska-P" }));
+}
+
 async function searchDeezerArtist(name) {
   // Deezer's public API needs NO authentication for search/artist endpoints.
   const url = `https://api.deezer.com/search/artist?q=${encodeURIComponent(name)}&limit=1`;
@@ -170,6 +218,30 @@ const RULES = {
   VALUE_MIN_MULTIPLIER: 0.3, // value can't fall below 30% of base cost
   VALUE_MAX_MULTIPLIER: 3.0, // value can't rise above 300% of base cost
 };
+
+// Explainability: turn "value went from 24M to 27M" into a real reason,
+// never a black box. Picks whichever category moved the most this run and
+// describes it in plain language — same categories the score is built from.
+function buildValueReason(artist) {
+  const catDeltas = {
+    momentum: (artist.momentum_score || 0) - (artist._momentumAtRunStart || 0),
+    performance: (artist.performance_score || 0) - (artist._performanceAtRunStart || 0),
+    activity: (artist.activity_score || 0) - (artist._activityAtRunStart || 0),
+    culture: (artist.culture_score || 0) - (artist._cultureAtRunStart || 0),
+  };
+  const labels = {
+    momentum: { up: "🔥 Streams et abonnés en forte hausse", down: "📉 Streams et abonnés en baisse" },
+    performance: { up: "📈 Classements Deezer en progression", down: "📉 Classements Deezer en recul" },
+    activity: { up: "🎵 Nouvelle sortie ou feature récente", down: "🎵 Aucune sortie récente" },
+    culture: { up: "🏆 Actu positive (jalon, award, buzz)", down: "⚠️ Actu négative" },
+  };
+  const entries = Object.entries(catDeltas)
+    .filter(([, v]) => v !== 0)
+    .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+  if (!entries.length) return null;
+  const [cat, val] = entries[0];
+  return labels[cat]?.[val > 0 ? "up" : "down"] || null;
+}
 
 async function applyScoreEvent(supabase, artist, category, delta, label, eventKey, poolAverage) {
   if (delta === 0) return 0;
@@ -287,6 +359,12 @@ export default async () => {
     await supabase.from("artists").update({ ...decayed, score: weighted }).eq("id", artist.id);
     Object.assign(artist, decayed, { score: weighted });
     artist._scoreAtRunStart = weighted; // baseline for this run's value calc
+    // Per-category baselines too — lets us say WHICH category drove a value
+    // change (momentum vs. a release vs. culture), not just "it moved".
+    artist._momentumAtRunStart = decayed.momentum_score;
+    artist._performanceAtRunStart = decayed.performance_score;
+    artist._activityAtRunStart = decayed.activity_score;
+    artist._cultureAtRunStart = decayed.culture_score;
   }
 
   for (const artist of artists) {
@@ -536,10 +614,13 @@ export default async () => {
         }
       }
 
-      // --- News (Google News RSS, no key needed) ---
+      // --- News (Google News RSS + Booska-P — both free, no key needed) ---
       {
-        const articles = await getArtistNews(artist.name);
-        for (const a of articles) {
+        const [googleArticles, booskaArticles] = await Promise.all([
+          getArtistNews(artist.name),
+          getBooskaPArtistNews(artist.name).catch(() => []),
+        ]);
+        for (const a of [...googleArticles, ...booskaArticles]) {
           if (!a.url) continue;
           const { error: newsErr } = await supabase
             .from("artist_news")
@@ -571,7 +652,11 @@ export default async () => {
           )
         );
         if (newValue !== currentValue) {
-          await supabase.from("artists").update({ value: newValue }).eq("id", artist.id);
+          const reason = buildValueReason(artist);
+          await supabase
+            .from("artists")
+            .update({ value: newValue, value_reason: reason, value_reason_at: new Date().toISOString() })
+            .eq("id", artist.id);
         }
       }
       // --- Milestones (round-number score thresholds) ---
@@ -600,6 +685,32 @@ export default async () => {
     } catch (e) {
       results.errors.push(`${artist.name}: ${e.message}`);
     }
+  }
+
+  // --- General rap news ticker (Booska-P feed, not tied to one artist) ---
+  // Feeds the Radar's "Actu rap" block — the holistic, non-artist-specific
+  // signal. Manual dedupe by URL since a null artist_id defeats the table's
+  // (artist_id, url) unique constraint (Postgres treats every NULL as distinct).
+  try {
+    const generalNews = await getGeneralRapNews();
+    for (const n of generalNews) {
+      if (!n.url) continue;
+      const { data: existing } = await supabase
+        .from("artist_news")
+        .select("id")
+        .eq("url", n.url)
+        .limit(1);
+      if (existing && existing.length) continue;
+      await supabase.from("artist_news").insert({
+        artist_id: null,
+        title: n.title,
+        url: n.url,
+        source: n.source,
+        published_at: n.published_at,
+      });
+    }
+  } catch (e) {
+    results.errors.push(`general news: ${e.message}`);
   }
 
   // --- Weekly Award: "Most Momentum This Week" ---

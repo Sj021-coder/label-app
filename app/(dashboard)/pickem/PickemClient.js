@@ -1,9 +1,85 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 
-export default function PickemClient({ predictions, myPicks, pickemScore }) {
+// Live countdown — the FOMO device. State is only ever written from a
+// setTimeout/setInterval callback (never synchronously in the effect body).
+function useCountdown(closesAt) {
+  const [label, setLabel] = useState("…");
+  useEffect(() => {
+    function tick() {
+      const diff = new Date(closesAt).getTime() - new Date().getTime();
+      if (diff <= 0) {
+        setLabel("Fermé");
+        return;
+      }
+      const h = Math.floor(diff / 3600000);
+      const m = Math.floor((diff % 3600000) / 60000);
+      const s = Math.floor((diff % 60000) / 1000);
+      setLabel(h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`);
+    }
+    const t0 = setTimeout(tick, 0);
+    const id = setInterval(tick, 1000);
+    return () => {
+      clearTimeout(t0);
+      clearInterval(id);
+    };
+  }, [closesAt]);
+  return label;
+}
+
+function PredictionCard({ p, myPick, loading, onVote, stake }) {
+  const countdown = useCountdown(p.closes_at);
+  const winDelta = Math.round(stake * ((p.coefficient || 2) - 1));
+  return (
+    <div className="bg-[var(--surface)] border border-[var(--border)] rounded-2xl p-3.5 mb-3">
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-[10px] font-bold text-[var(--crimson)] uppercase tracking-wide">
+          ⏳ {countdown}
+        </span>
+        <span className="mono text-[10px] font-bold text-[var(--text-faint)]">
+          Cote x{p.coefficient}
+        </span>
+      </div>
+      <div className="text-sm font-semibold mb-3">{p.question}</div>
+      <div className="grid grid-cols-2 gap-2">
+        {["A", "B"].map((opt) => {
+          const label = opt === "A" ? p.option_a : p.option_b;
+          const isPicked = myPick === opt;
+          return (
+            <button
+              key={opt}
+              disabled={!!myPick || loading}
+              onClick={() => onVote(p.id, opt)}
+              className={`text-sm font-bold py-3 rounded-xl border ${
+                isPicked
+                  ? "bg-[var(--gold)] text-[#1a1310] border-[var(--gold)]"
+                  : myPick
+                  ? "bg-[var(--surface-2)] text-[var(--text-faint)] border-[var(--border)]"
+                  : "bg-[var(--surface-2)] text-[var(--text)] border-[var(--border)]"
+              }`}
+            >
+              {label}
+            </button>
+          );
+        })}
+      </div>
+      {myPick ? (
+        <div className="text-[11px] text-[var(--text-faint)] mt-2">
+          Ton pick est enregistré — résultat bientôt.
+        </div>
+      ) : (
+        <div className="text-[11px] text-[var(--text-faint)] mt-2">
+          Mise {stake} pts · +{winDelta} si gagné, -{stake} si perdu. Une fois fermé,
+          c&apos;est perdu — impossible de participer après.
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function PickemClient({ predictions, myPicks, pickemScore, stake }) {
   const [loadingId, setLoadingId] = useState(null);
   const [error, setError] = useState("");
   const router = useRouter();
@@ -36,7 +112,13 @@ export default function PickemClient({ predictions, myPicks, pickemScore }) {
         <div className="text-[13px] uppercase tracking-wide text-[var(--text-faint)] font-bold">
           Pick&apos;em
         </div>
-        <div className="mono text-sm font-bold text-[var(--gold)]">{pickemScore} pts</div>
+        <div
+          className={`mono text-sm font-bold ${
+            pickemScore >= 0 ? "text-[var(--gold)]" : "text-[var(--crimson)]"
+          }`}
+        >
+          {pickemScore} pts
+        </div>
       </div>
 
       {error && <p className="text-[var(--crimson)] text-xs mb-3">{error}</p>}
@@ -49,44 +131,16 @@ export default function PickemClient({ predictions, myPicks, pickemScore }) {
           Aucun pick&apos;em ouvert pour le moment.
         </div>
       ) : (
-        open.map((p) => {
-          const myPick = myPickMap[p.id];
-          return (
-            <div
-              key={p.id}
-              className="bg-[var(--surface)] border border-[var(--border)] rounded-2xl p-3.5 mb-3"
-            >
-              <div className="text-sm font-semibold mb-3">{p.question}</div>
-              <div className="grid grid-cols-2 gap-2">
-                {["A", "B"].map((opt) => {
-                  const label = opt === "A" ? p.option_a : p.option_b;
-                  const isPicked = myPick === opt;
-                  return (
-                    <button
-                      key={opt}
-                      disabled={!!myPick || loadingId === p.id}
-                      onClick={() => vote(p.id, opt)}
-                      className={`text-sm font-bold py-3 rounded-xl border ${
-                        isPicked
-                          ? "bg-[var(--gold)] text-[#1a1310] border-[var(--gold)]"
-                          : myPick
-                          ? "bg-[var(--surface-2)] text-[var(--text-faint)] border-[var(--border)]"
-                          : "bg-[var(--surface-2)] text-[var(--text)] border-[var(--border)]"
-                      }`}
-                    >
-                      {label}
-                    </button>
-                  );
-                })}
-              </div>
-              {myPick && (
-                <div className="text-[11px] text-[var(--text-faint)] mt-2">
-                  Ton pick est enregistré — résultat bientôt.
-                </div>
-              )}
-            </div>
-          );
-        })
+        open.map((p) => (
+          <PredictionCard
+            key={p.id}
+            p={p}
+            myPick={myPickMap[p.id]}
+            loading={loadingId === p.id}
+            onVote={vote}
+            stake={stake}
+          />
+        ))
       )}
 
       <div className="text-[13px] uppercase tracking-wide text-[var(--text-faint)] font-bold mb-2 mt-6">
@@ -100,6 +154,7 @@ export default function PickemClient({ predictions, myPicks, pickemScore }) {
         closed.map((p) => {
           const myPick = myPickMap[p.id];
           const won = p.correct_option && myPick === p.correct_option;
+          const winDelta = Math.round(stake * ((p.coefficient || 2) - 1));
           return (
             <div
               key={p.id}
@@ -110,7 +165,7 @@ export default function PickemClient({ predictions, myPicks, pickemScore }) {
                 <div className="text-xs text-[var(--text-faint)]">
                   {p.correct_option
                     ? `Réponse : ${p.correct_option === "A" ? p.option_a : p.option_b}`
-                    : "En attente de résolution"}
+                    : "Fermé — résultat à venir"}
                 </div>
               </div>
               {p.correct_option && myPick && (
@@ -119,8 +174,11 @@ export default function PickemClient({ predictions, myPicks, pickemScore }) {
                     won ? "text-[var(--gold)]" : "text-[var(--crimson)]"
                   }`}
                 >
-                  {won ? "+10" : "Raté"}
+                  {won ? `+${winDelta}` : `-${stake}`}
                 </span>
+              )}
+              {p.correct_option && !myPick && (
+                <span className="text-xs text-[var(--text-faint)]">Pas joué</span>
               )}
             </div>
           );

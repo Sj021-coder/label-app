@@ -39,7 +39,7 @@ export default async function AdminPage() {
 
   const { data: predictions } = await supabase
     .from("predictions")
-    .select("id, question, option_a, option_b, correct_option, closes_at")
+    .select("id, question, option_a, option_b, correct_option, closes_at, coefficient")
     .order("created_at", { ascending: false })
     .limit(15);
 
@@ -49,6 +49,44 @@ export default async function AdminPage() {
     .eq("reviewed", false)
     .order("fetched_at", { ascending: false })
     .limit(20);
+
+  // Real signals to seed Pick'em questions from — admin still writes/edits
+  // every question by hand, this only removes the "start from a blank page" step.
+  const { data: upcomingForPickem } = await supabase
+    .from("upcoming_releases")
+    .select("id, title, scheduled_at, artist_id, artists(name)")
+    .gte("scheduled_at", new Date().toISOString())
+    .order("scheduled_at", { ascending: true })
+    .limit(6);
+
+  const radarSuggestions = [
+    ...(upcomingForPickem || [])
+      .filter((u) => u.artists?.name)
+      .map((u) => {
+        const closes = new Date(u.scheduled_at);
+        closes.setDate(closes.getDate() + 3); // 3 days after release to vote
+        return {
+          key: `release-${u.id}`,
+          tag: "🎵 Sortie à venir",
+          raw: `${u.artists.name} — « ${u.title} »`,
+          question: `« ${u.title} » de ${u.artists.name} — un carton dans les 3 jours ?`,
+          optionA: "Oui, ça performe",
+          optionB: "Non, ça passe inaperçu",
+          artistId: u.artist_id,
+          suggestedClosesAt: closes.toISOString().slice(0, 16),
+        };
+      }),
+    ...(newsItems || []).slice(0, 6).map((n) => ({
+      key: `news-${n.id}`,
+      tag: `📰 ${n.source || "Actu"}${n.artists?.name ? " · " + n.artists.name : ""}`,
+      raw: n.title,
+      question: `« ${n.title} » — c'est confirmé ?`,
+      optionA: "Confirmé",
+      optionB: "Pas si simple",
+      artistId: n.artist_id,
+      suggestedClosesAt: "",
+    })),
+  ];
 
   // 📊 KPIs. Accounts + captains are exact all-time (from profiles);
   // drafted + shares are counted from the events table (start from tracking).
@@ -96,7 +134,11 @@ export default async function AdminPage() {
         <div className="text-[13px] uppercase tracking-wide text-[var(--text-faint)] font-bold mb-3">
           Gestion Pick&apos;em
         </div>
-        <AdminPickem artists={artists || []} predictions={predictions || []} />
+        <AdminPickem
+          artists={artists || []}
+          predictions={predictions || []}
+          radarSuggestions={radarSuggestions}
+        />
       </div>
 
       <div className="mt-10 pt-6 border-t border-[var(--border)]">
