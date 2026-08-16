@@ -16,6 +16,8 @@ create table if not exists leagues (
   owner_id uuid not null references profiles(id) on delete cascade,
   color_primary text not null default '#dda63a',
   color_secondary text not null default '#8a6cff',
+  avatar_url text,                       -- profile picture — YouTube-channel style
+  banner_url text,                       -- optional banner across the top
   tagline text,
   youtube_url text,
   twitch_url text,
@@ -46,3 +48,23 @@ create policy "users create own league" on leagues for insert with check (auth.u
 create policy "users update own league" on leagues for update using (auth.uid() = owner_id);
 create policy "users join a league themselves" on league_members for insert with check (auth.uid() = user_id);
 create policy "users leave a league themselves" on league_members for delete using (auth.uid() = user_id);
+
+-- ============================================================
+-- Storage — real image upload for avatar/banner (not a URL-paste box).
+-- Public bucket: these are branding images meant to be seen by everyone
+-- who opens the league page, same as a YouTube channel picture/banner.
+-- ============================================================
+insert into storage.buckets (id, name, public)
+values ('league-assets', 'league-assets', true)
+on conflict (id) do nothing;
+
+create policy "league assets are publicly readable" on storage.objects
+  for select using (bucket_id = 'league-assets');
+
+create policy "authenticated users can upload league assets" on storage.objects
+  for insert with check (bucket_id = 'league-assets' and auth.role() = 'authenticated');
+
+-- ⚠️ Any authenticated user can upload to this bucket (not just their own
+-- league's assets) — fine for now since it's low-stakes branding images and
+-- you're the only real user during this phase. Worth tightening (path-prefix
+-- ownership check) before public launch, same bucket as the other RLS items.

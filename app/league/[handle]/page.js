@@ -58,36 +58,55 @@ export default async function LeaguePage({ params }) {
 
   return (
     <div className="min-h-screen pb-16">
-      {/* Branded banner — the creator's colors, everywhere */}
+      {/* YouTube-style header: banner (image or gradient fallback) + avatar
+          overlapping bottom-left + name/tagline/socials below, his territory */}
       <div
-        className="px-5 pt-10 pb-8 text-center"
+        className="w-full aspect-[3/1] max-h-56"
         style={{
-          background: `linear-gradient(135deg, ${league.color_primary}, ${league.color_secondary})`,
+          background: league.banner_url
+            ? `center / cover no-repeat url(${league.banner_url})`
+            : `linear-gradient(135deg, ${league.color_primary}, ${league.color_secondary})`,
         }}
-      >
-        <div className="text-[11px] uppercase tracking-wide text-white/70 font-bold mb-1">
-          Ligue privée
+      />
+
+      <div className="px-5 max-w-md mx-auto">
+        <div className="flex items-end gap-3 -mt-8 mb-3">
+          <div
+            className="w-16 h-16 rounded-full border-4 border-[var(--bg)] overflow-hidden flex-shrink-0 flex items-center justify-center text-lg font-extrabold text-white"
+            style={{ background: league.color_secondary }}
+          >
+            {league.avatar_url ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={league.avatar_url} alt={league.name} className="w-full h-full object-cover" />
+            ) : (
+              league.name.slice(0, 2).toUpperCase()
+            )}
+          </div>
+          <div className="pb-1">
+            <div className="text-[10px] uppercase tracking-wide text-[var(--text-faint)] font-bold">
+              Ligue privée
+            </div>
+            <div className="display text-xl leading-tight">{league.name}</div>
+          </div>
         </div>
-        <div className="display text-3xl text-white mb-1 drop-shadow">{league.name}</div>
-        {league.tagline && <p className="text-white/90 text-sm mb-3">{league.tagline}</p>}
+
+        {league.tagline && <p className="text-[var(--text-muted)] text-sm mb-3">{league.tagline}</p>}
         {socials.length > 0 && (
-          <div className="flex justify-center gap-3 mt-2">
+          <div className="flex flex-wrap gap-2 mb-5">
             {socials.map(([key, label]) => (
               <a
                 key={key}
                 href={league[key]}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-xs font-bold text-white bg-black/25 rounded-full px-3 py-1.5"
+                className="text-xs font-bold rounded-full px-3 py-1.5 text-white"
+                style={{ background: league.color_primary }}
               >
                 {label}
               </a>
             ))}
           </div>
         )}
-      </div>
-
-      <div className="px-5 pt-5 max-w-md mx-auto">
         <div className="flex items-center justify-between mb-5">
           <div className="text-[13px] uppercase tracking-wide text-[var(--text-faint)] font-bold">
             {memberIds.length} membre{memberIds.length > 1 ? "s" : ""}

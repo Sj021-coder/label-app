@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 
@@ -21,6 +21,7 @@ function randomCode() {
 export default function CreateLeagueForm({ suggestedName }) {
   const router = useRouter();
   const supabase = useMemo(() => createClient(), []);
+  const fileSeq = useRef(0);
 
   const [name, setName] = useState(suggestedName);
   // null = still following the name; once the creator edits it directly,
@@ -29,6 +30,10 @@ export default function CreateLeagueForm({ suggestedName }) {
   const handle = handleOverride ?? slugify(name);
   const [colorPrimary, setColorPrimary] = useState("#dda63a");
   const [colorSecondary, setColorSecondary] = useState("#8a6cff");
+  const [avatarFile, setAvatarFile] = useState(null);
+  const [avatarPreview, setAvatarPreview] = useState(null);
+  const [bannerFile, setBannerFile] = useState(null);
+  const [bannerPreview, setBannerPreview] = useState(null);
   const [tagline, setTagline] = useState("");
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [twitchUrl, setTwitchUrl] = useState("");
@@ -54,11 +59,60 @@ export default function CreateLeagueForm({ suggestedName }) {
   const availStatus =
     handle.length < 2 ? null : avail && avail.handle === handle ? (avail.taken ? "taken" : "free") : "checking";
 
+  function pickAvatar(file) {
+    if (!file) return;
+    setAvatarFile(file);
+    setAvatarPreview((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return URL.createObjectURL(file);
+    });
+  }
+  function pickBanner(file) {
+    if (!file) return;
+    setBannerFile(file);
+    setBannerPreview((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return URL.createObjectURL(file);
+    });
+  }
+  // Revoke any lingering local preview URLs on unmount.
+  useEffect(
+    () => () => {
+      if (avatarPreview) URL.revokeObjectURL(avatarPreview);
+      if (bannerPreview) URL.revokeObjectURL(bannerPreview);
+    },
+    [avatarPreview, bannerPreview]
+  );
+
+  async function uploadAsset(file, kind) {
+    const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
+    const path = `${kind}-${(fileSeq.current += 1)}-${Math.floor(Math.random() * 1e6)}.${ext}`;
+    const { error: upErr } = await supabase.storage
+      .from("league-assets")
+      .upload(path, file, { upsert: true });
+    if (upErr) throw upErr;
+    const { data } = supabase.storage.from("league-assets").getPublicUrl(path);
+    return data.publicUrl;
+  }
+
   async function createLeague(e) {
     e.preventDefault();
     setError("");
     if (availStatus === "taken" || !name.trim() || handle.length < 2) return;
     setLoading(true);
+
+    let avatarUrl = null;
+    let bannerUrl = null;
+    try {
+      [avatarUrl, bannerUrl] = await Promise.all([
+        avatarFile ? uploadAsset(avatarFile, "avatar") : Promise.resolve(null),
+        bannerFile ? uploadAsset(bannerFile, "banner") : Promise.resolve(null),
+      ]);
+    } catch {
+      setLoading(false);
+      setError("Impossible d'envoyer les images. Réessaie.");
+      return;
+    }
 
     const {
       data: { user },
@@ -72,6 +126,8 @@ export default function CreateLeagueForm({ suggestedName }) {
         owner_id: user.id,
         color_primary: colorPrimary,
         color_secondary: colorSecondary,
+        avatar_url: avatarUrl,
+        banner_url: bannerUrl,
         tagline: tagline.trim() || null,
         youtube_url: youtubeUrl.trim() || null,
         twitch_url: twitchUrl.trim() || null,
@@ -103,6 +159,51 @@ export default function CreateLeagueForm({ suggestedName }) {
         Ton territoire, ton lien, tes couleurs. Tes membres jouent le même jeu — juste
         classés entre eux.
       </p>
+
+      {/* YouTube-style preview: banner on top, avatar overlapping bottom-left */}
+      <div className="mb-6">
+        <label
+          className="relative block w-full aspect-[3/1] rounded-2xl overflow-hidden cursor-pointer border border-[var(--border)]"
+          style={{
+            background: bannerPreview
+              ? undefined
+              : `linear-gradient(135deg, ${colorPrimary}, ${colorSecondary})`,
+          }}
+        >
+          {bannerPreview && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={bannerPreview} alt="" className="w-full h-full object-cover" />
+          )}
+          <div className="absolute inset-0 flex items-center justify-center bg-black/0 hover:bg-black/20 transition">
+            <span className="text-white text-xs font-bold bg-black/40 rounded-full px-3 py-1.5">
+              {bannerPreview ? "Changer la bannière" : "+ Bannière (optionnel)"}
+            </span>
+          </div>
+          <input
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => pickBanner(e.target.files?.[0])}
+          />
+        </label>
+
+        <label className="relative -mt-8 ml-3 block w-16 h-16 rounded-full overflow-hidden border-4 border-[var(--bg)] cursor-pointer bg-[var(--surface-2)]">
+          {avatarPreview ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={avatarPreview} alt="" className="w-full h-full object-cover" />
+          ) : (
+            <div className="w-full h-full flex items-center justify-center text-[10px] text-[var(--text-faint)] font-bold text-center px-1">
+              Photo
+            </div>
+          )}
+          <input
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => pickAvatar(e.target.files?.[0])}
+          />
+        </label>
+      </div>
 
       <form onSubmit={createLeague} className="space-y-4">
         <div>
