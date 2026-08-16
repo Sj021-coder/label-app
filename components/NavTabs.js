@@ -9,6 +9,7 @@ const TABS = [
   { href: "/radar", label: "Radar" },
   { href: "/pickem", label: "Pick'em" },
   { href: "/leaderboard", label: "Classement" },
+  { href: "/league", label: "Ligues" },
   { href: "/admin", label: "Admin", adminOnly: true },
 ];
 
@@ -19,7 +20,7 @@ export default function NavTabs({ isAdmin = false }) {
   return (
     <div className="flex px-4 gap-1 border-b border-[var(--border)] mb-4">
       {tabs.map((t) => {
-        const active = pathname === t.href;
+        const active = pathname === t.href || pathname.startsWith(`${t.href}/`);
         return (
           <Link
             key={t.href}
