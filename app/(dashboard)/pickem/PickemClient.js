@@ -32,6 +32,7 @@ function useCountdown(closesAt) {
 function PredictionCard({ p, myPick, loading, onVote, stake }) {
   const countdown = useCountdown(p.closes_at);
   const winDelta = Math.round(stake * ((p.coefficient || 2) - 1));
+  const loseDelta = Math.round((2 / 3) * winDelta); // losing costs less than winning pays
   return (
     <div className="bg-[var(--surface)] border border-[var(--border)] rounded-2xl p-3.5 mb-3">
       <div className="flex items-center justify-between mb-1">
@@ -71,7 +72,7 @@ function PredictionCard({ p, myPick, loading, onVote, stake }) {
         </div>
       ) : (
         <div className="text-[11px] text-[var(--text-faint)] mt-2">
-          Mise {stake} pts · +{winDelta} si gagné, -{stake} si perdu. Une fois fermé,
+          +{winDelta} si gagné, -{loseDelta} si perdu — tu risques moins que tu ne gagnes. Une fois fermé,
           c&apos;est perdu — impossible de participer après.
         </div>
       )}
@@ -155,6 +156,7 @@ export default function PickemClient({ predictions, myPicks, pickemScore, stake 
           const myPick = myPickMap[p.id];
           const won = p.correct_option && myPick === p.correct_option;
           const winDelta = Math.round(stake * ((p.coefficient || 2) - 1));
+          const loseDelta = Math.round((2 / 3) * winDelta);
           return (
             <div
               key={p.id}
@@ -174,7 +176,7 @@ export default function PickemClient({ predictions, myPicks, pickemScore, stake 
                     won ? "text-[var(--gold)]" : "text-[var(--crimson)]"
                   }`}
                 >
-                  {won ? `+${winDelta}` : `-${stake}`}
+                  {won ? `+${winDelta}` : `-${loseDelta}`}
                 </span>
               )}
               {p.correct_option && !myPick && (

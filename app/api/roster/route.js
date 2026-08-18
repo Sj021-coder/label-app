@@ -1,13 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import {
-  BUDGET_TOTAL,
-  ROSTER_SIZE,
-  totalCost,
-  TRANSFER_BANK_CAP,
-  TRANSFER_REFRESH_DAYS,
-  TRANSFER_PENALTY,
-} from "@/lib/gameRules";
+import { BUDGET_TOTAL, ROSTER_SIZE, totalCost, TRANSFER_PENALTY } from "@/lib/gameRules";
+import { getWeeklyProgram, formatCountdown } from "@/lib/weeklyProgram";
 
 export async function POST(request) {
   const supabase = await createClient();
@@ -67,24 +61,28 @@ export async function DELETE(request) {
   let transferInfo = null;
 
   if (isTransfer) {
+    // Transfers only happen inside the shared weekly window — same window
+    // for everyone, no more personal rolling clock. free_transfers itself
+    // is refilled for the whole pool by the sync engine every Monday.
+    const program = getWeeklyProgram();
+    if (program.phase !== "team") {
+      return NextResponse.json(
+        {
+          error: `La fenêtre transfert est fermée. Prochaine ouverture dans ${formatCountdown(
+            program.nextAt
+          )}.`,
+        },
+        { status: 403 }
+      );
+    }
+
     const { data: profile } = await supabase
       .from("profiles")
-      .select("free_transfers, last_transfer_refresh, penalty_points")
+      .select("free_transfers, penalty_points")
       .eq("id", user.id)
       .single();
 
     let freeTransfers = profile?.free_transfers ?? 1;
-    const lastRefresh = profile?.last_transfer_refresh
-      ? new Date(profile.last_transfer_refresh)
-      : new Date();
-    const daysSinceRefresh = (Date.now() - lastRefresh.getTime()) / (1000 * 60 * 60 * 24);
-
-    let nextRefreshDate = profile?.last_transfer_refresh;
-    if (daysSinceRefresh >= TRANSFER_REFRESH_DAYS) {
-      freeTransfers = Math.min(freeTransfers + 1, TRANSFER_BANK_CAP);
-      nextRefreshDate = new Date().toISOString().slice(0, 10);
-    }
-
     let newPenalty = profile?.penalty_points ?? 0;
     if (freeTransfers > 0) {
       freeTransfers -= 1;
@@ -94,11 +92,7 @@ export async function DELETE(request) {
 
     await supabase
       .from("profiles")
-      .update({
-        free_transfers: freeTransfers,
-        last_transfer_refresh: nextRefreshDate,
-        penalty_points: newPenalty,
-      })
+      .update({ free_transfers: freeTransfers, penalty_points: newPenalty })
       .eq("id", user.id);
 
     transferInfo = { freeTransfersRemaining: freeTransfers, penaltyApplied: freeTransfers === 0 };

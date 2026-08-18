@@ -17,6 +17,7 @@
 // with no logged-in user — never expose that key to the browser/client.
 
 import { createClient } from "@supabase/supabase-js";
+import { TRANSFER_FREE_PER_WEEK, TRANSFER_BANK_CAP } from "../../lib/gameRules.js";
 
 async function getSpotifyToken() {
   const res = await fetch("https://accounts.spotify.com/api/token", {
@@ -332,6 +333,23 @@ export default async () => {
   }
 
   const results = { spotifySynced: 0, youtubeSynced: 0, newsFound: 0, errors: [] };
+
+  // --- Weekly transfer reset (shared calendar, not a personal rolling clock) ---
+  // Refills everyone's free_transfers TOGETHER, at the same moment the "team"
+  // window (captain + trade) opens for the whole pool — Monday's morning run
+  // only (UTC hour < 12 excludes the 20:00 run so this fires once per week).
+  const now = new Date();
+  if (now.getUTCDay() === 1 && now.getUTCHours() < 12) {
+    const { data: profiles } = await supabase.from("profiles").select("id, free_transfers");
+    for (const p of profiles || []) {
+      const refreshed = Math.min((p.free_transfers || 0) + TRANSFER_FREE_PER_WEEK, TRANSFER_BANK_CAP);
+      await supabase
+        .from("profiles")
+        .update({ free_transfers: refreshed, last_transfer_refresh: now.toISOString().slice(0, 10) })
+        .eq("id", p.id);
+    }
+    results.transfersReset = (profiles || []).length;
+  }
 
   // Pool average — used for anti-dominance dampening (computed BEFORE this
   // run's changes, so it reflects standing coming into today).

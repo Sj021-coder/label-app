@@ -1,6 +1,8 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import NavTabs from "@/components/NavTabs";
+import WeeklyBanner from "@/components/WeeklyBanner";
+import { getBilanWindow } from "@/lib/weeklyProgram";
 
 export default async function DashboardLayout({ children }) {
   const supabase = await createClient();
@@ -11,10 +13,12 @@ export default async function DashboardLayout({ children }) {
 
   const { data: profile } = await supabase
     .from("profiles")
-    .select("username, is_admin")
+    .select("username, is_admin, created_at")
     .eq("id", user.id)
     .single();
   if (!profile) redirect("/");
+
+  const bilanReady = getBilanWindow(profile.created_at).ready;
 
   const [{ data: totals }, { data: activeSeason }] = await Promise.all([
     supabase.from("user_totals").select("*").eq("user_id", user.id).single(),
@@ -39,6 +43,7 @@ export default async function DashboardLayout({ children }) {
           Saison : {activeSeason.name}
         </div>
       )}
+      <WeeklyBanner bilanReady={bilanReady} />
       <NavTabs isAdmin={!!profile.is_admin} />
       <div className="px-4 pb-10">{children}</div>
     </div>
