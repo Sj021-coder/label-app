@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import NavTabs from "@/components/NavTabs";
 import WeeklyBanner from "@/components/WeeklyBanner";
+import SignOutButton from "@/components/SignOutButton";
 import { getBilanWindow } from "@/lib/weeklyProgram";
 
 export default async function DashboardLayout({ children }) {
@@ -36,6 +37,7 @@ export default async function DashboardLayout({ children }) {
             {profile.username}
           </div>
           <div className="mono font-bold text-lg">{totals?.total_score ?? 0} pts</div>
+          <SignOutButton />
         </div>
       </div>
       {activeSeason?.name && (
