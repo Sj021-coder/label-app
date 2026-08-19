@@ -282,15 +282,25 @@ function buildValueReason(artist) {
   return labels[cat]?.[val > 0 ? "up" : "down"] || null;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // Runs `fn` over `items` in concurrent batches instead of one at a time.
 // This is the real fix for the function timing out: ~100 artists x several
 // sequential API calls each was taking minutes done serially. Batches of
 // BATCH_SIZE run concurrently, so wall time is roughly (count / batchSize)
 // slow-artists instead of ALL of them, one after another.
-async function processInBatches(items, batchSize, fn) {
+//
+// Optional `delayMs` paces batches over TIME, not just concurrency — Spotify
+// kept 429-ing release/feature detection even at low concurrency, which
+// means the real constraint is requests-per-time-window, not requests
+// in-flight at once. A pause between batches respects that directly.
+async function processInBatches(items, batchSize, fn, delayMs = 0) {
   for (let i = 0; i < items.length; i += batchSize) {
     const batch = items.slice(i, i + batchSize);
     await Promise.all(batch.map(fn));
+    if (delayMs && i + batchSize < items.length) await sleep(delayMs);
   }
 }
 
@@ -466,9 +476,12 @@ export default async () => {
   // --- Spotify pre-fetch ---
   // Popularity/followers now come from ONE bulk call (up to 50 IDs each) —
   // the real fix, not just gentler pacing. Release/feature detection has no
-  // bulk equivalent in Spotify's API, so those stay per-artist, but in small
-  // batches (their own pace, decoupled from Deezer/YouTube/news below).
-  const SPOTIFY_BATCH_SIZE = 4;
+  // bulk equivalent in Spotify's API, so those stay per-artist. Confirmed via
+  // a real run: even 4-at-a-time still got 429'd, meaning the real limit is
+  // requests-PER-TIME, not requests-in-flight — so this is now small batches
+  // (2) AND paced with a real pause between them, not just lower concurrency.
+  const SPOTIFY_BATCH_SIZE = 2;
+  const SPOTIFY_BATCH_DELAY_MS = 400;
   const spotifyCache = new Map();
   if (spotifyToken) {
     const spotifyArtists = artists.filter((a) => a.spotify_id);
@@ -496,7 +509,7 @@ export default async () => {
         logSpotifyErrorOnce(e);
       }
       spotifyCache.set(artist.id, entry);
-    });
+    }, SPOTIFY_BATCH_DELAY_MS);
   }
 
   // --- YouTube pre-fetch — same bulk-call fix ---
