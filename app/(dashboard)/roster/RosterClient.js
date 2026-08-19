@@ -94,6 +94,14 @@ export default function RosterClient({
         )}
       </div>
 
+      <Link
+        href="/duel"
+        className="flex items-center justify-between bg-[var(--surface)] border border-[var(--violet)]/40 rounded-xl px-3.5 py-2.5 mb-4 text-xs"
+      >
+        <span className="font-bold">⚔️ Défier quelqu&apos;un</span>
+        <span className="text-[var(--violet)] font-bold">→</span>
+      </Link>
+
       {/* Transfers/penalty status */}
       <div className="flex items-center justify-between bg-[var(--surface)] border border-[var(--border)] rounded-xl px-3.5 py-2.5 mb-4 text-xs">
         <span className="text-[var(--text-faint)]">

@@ -10,6 +10,7 @@ const TABS = [
   { href: "/pickem", label: "Pick'em" },
   { href: "/leaderboard", label: "Classement" },
   { href: "/league", label: "Ligues" },
+  { href: "/team", label: "Équipes" },
   { href: "/admin", label: "Admin", adminOnly: true },
 ];
 
