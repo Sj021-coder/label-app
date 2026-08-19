@@ -1,9 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { TIERS } from "@/lib/gameRules";
+import { createClient } from "@/lib/supabase/client";
 
 export default function RosterClient({
   roster,
@@ -16,8 +17,59 @@ export default function RosterClient({
 }) {
   const [loadingId, setLoadingId] = useState(null);
   const router = useRouter();
+  const supabase = useMemo(() => createClient(), []);
 
-  const slots = [...roster];
+  // The "stock ticker" feel, done honestly: scores only ever change when a
+  // REAL sync writes a REAL number (twice daily) — nothing here is simulated
+  // between syncs. What's live is the PUSH: anyone with this page open sees
+  // that real write land instantly, no refresh needed, same idea as a stock
+  // app telling you the second a real trade prints a new price.
+  // Overrides layered on top of the server-provided roster, not a copy of it
+  // — so there's no effect syncing prop-into-state (an anti-pattern); the
+  // rendered roster is just derived at render time, self-correcting whenever
+  // a fresh `roster` prop arrives (a captain change, page reload, etc.).
+  const [liveOverrides, setLiveOverrides] = useState({});
+  const [flashId, setFlashId] = useState(null);
+  const [deltaFlash, setDeltaFlash] = useState(null); // { id, delta, key }
+  const flashSeq = useRef(0);
+
+  const liveRoster = roster.map((a) => (liveOverrides[a.id] ? { ...a, ...liveOverrides[a.id] } : a));
+
+  useEffect(() => {
+    const rosterIds = roster.map((a) => a.id);
+    if (!rosterIds.length) return;
+
+    const channel = supabase
+      .channel("roster-live")
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "artists" },
+        (payload) => {
+          const updated = payload.new;
+          const before = payload.old;
+          if (!rosterIds.includes(updated.id)) return;
+
+          setLiveOverrides((prev) => ({
+            ...prev,
+            [updated.id]: { score: updated.score, value: updated.value, value_reason: updated.value_reason },
+          }));
+
+          const delta = (updated.score ?? 0) - (before?.score ?? updated.score ?? 0);
+          setFlashId(updated.id);
+          if (delta !== 0) {
+            setDeltaFlash({ id: updated.id, delta, key: (flashSeq.current += 1) });
+          }
+          setTimeout(() => setFlashId((cur) => (cur === updated.id ? null : cur)), 1000);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [roster, supabase]);
+
+  const slots = [...liveRoster];
   while (slots.length < rosterSize) slots.push(null);
 
   async function setCaptain(artistId) {
@@ -35,9 +87,9 @@ export default function RosterClient({
     <div>
       <div className="flex items-center justify-between mb-3">
         <div className="text-[13px] uppercase tracking-wide text-[var(--text-faint)] font-bold">
-          Mon label ({roster.length}/{rosterSize})
+          Mon label ({liveRoster.length}/{rosterSize})
         </div>
-        {roster.length > 0 && !hasDiversity && (
+        {liveRoster.length > 0 && !hasDiversity && (
           <span className="text-[11px] text-[var(--crimson)]">Règle diversité non respectée</span>
         )}
       </div>
@@ -57,14 +109,25 @@ export default function RosterClient({
           artist ? (
             <div
               key={artist.id}
-              className={`bg-[var(--surface)] border rounded-2xl p-2.5 relative ${
+              className={`bg-[var(--surface)] border rounded-2xl p-2.5 relative transition-shadow ${
                 artist.id === captainArtistId ? "border-[var(--gold)]" : "border-[var(--border)]"
-              }`}
+              } ${flashId === artist.id ? "live-flash" : ""}`}
             >
               {artist.id === captainArtistId && (
                 <div className="absolute -top-1.5 -left-1.5 w-5 h-5 rounded-full bg-[var(--gold)] text-[#1a1310] text-[10px] font-black flex items-center justify-center z-10">
                   C
                 </div>
+              )}
+              {deltaFlash?.id === artist.id && (
+                <span
+                  key={deltaFlash.key}
+                  className={`float-delta absolute top-1 right-1 mono text-xs font-bold z-10 ${
+                    deltaFlash.delta > 0 ? "text-[var(--gold)]" : "text-[var(--crimson)]"
+                  }`}
+                >
+                  {deltaFlash.delta > 0 ? "+" : ""}
+                  {deltaFlash.delta}
+                </span>
               )}
               <div className="mb-2 aspect-square rounded-xl overflow-hidden bg-[var(--surface-2)]">
                 {artist.image_url ? (
@@ -133,7 +196,7 @@ export default function RosterClient({
       </div>
       {recentEvents.length === 0 ? (
         <div className="text-center text-[var(--text-faint)] text-sm py-6">
-          {roster.length === 0
+          {liveRoster.length === 0
             ? "Ajoute des artistes à ton label pour voir leur activité."
             : "Aucun évènement encore pour ton label."}
         </div>

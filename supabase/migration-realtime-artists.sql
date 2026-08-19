@@ -1,0 +1,11 @@
+-- ============================================================
+-- MIGRATION — Enable Realtime on artists (live score/value updates)
+-- Run this in Supabase SQL Editor. Safe: only turns on change broadcasting
+-- for a table that's already public-readable — no new data exposed.
+--
+-- This is what lets Roster (and later Radar/Leaderboard) push a real score
+-- change to anyone with the page open the instant a sync writes it, instead
+-- of requiring a manual refresh — the honest version of "feels alive":
+-- real writes pushed live, never simulated movement between real syncs.
+-- ============================================================
+alter publication supabase_realtime add table artists;

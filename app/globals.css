@@ -131,6 +131,14 @@ body {
 }
 .spin-slow { animation: spinSlow 9s linear infinite; }
 
+/* Live roster ticker — a real write just landed via Realtime, not simulated */
+@keyframes liveFlash {
+  0% { box-shadow: 0 0 0 0 var(--gold); }
+  40% { box-shadow: 0 0 0 3px var(--gold); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.live-flash { animation: liveFlash 900ms ease-out; }
+
 /* Variant C — unaffordable card shake */
 @keyframes shake {
   0%, 100% { transform: translateX(0); }
@@ -143,7 +151,7 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   .float-delta, .slot-pop, .ceremony-vinyl, .fade-up, .chip-in,
-  .skeleton, .sheet-up, .overlay-fade, .spin-slow, .shake {
+  .skeleton, .sheet-up, .overlay-fade, .spin-slow, .shake, .live-flash {
     animation-duration: 1ms !important;
   }
 }

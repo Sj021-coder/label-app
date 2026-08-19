@@ -50,6 +50,30 @@ async function getSpotifyArtistData(token, spotifyId) {
   return { popularity: data.popularity ?? null, followers: data.followers?.total ?? null };
 }
 
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+// The real fix for both the timeout AND the 429s: Spotify's /v1/artists
+// endpoint accepts up to 50 IDs in ONE call. ~40 individual calls become 1.
+// Returns a Map keyed by spotifyId — missing/invalid IDs are simply absent.
+async function getSpotifyArtistsBatch(token, spotifyIds) {
+  const out = new Map();
+  for (const ids of chunk(spotifyIds, 50)) {
+    const res = await fetch(`https://api.spotify.com/v1/artists?ids=${ids.join(",")}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error(`Spotify batch fetch failed: ${res.status} ${res.statusText}`);
+    const data = await res.json();
+    for (const a of data.artists || []) {
+      if (a) out.set(a.id, { popularity: a.popularity ?? null, followers: a.followers?.total ?? null });
+    }
+  }
+  return out;
+}
+
 async function getLatestRelease(token, spotifyId) {
   const url = `https://api.spotify.com/v1/artists/${spotifyId}/albums?include_groups=album,single&limit=1&market=FR`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
@@ -75,17 +99,27 @@ async function getLatestFeature(token, spotifyId) {
   return { name: latest.name, releaseDate: latest.release_date, byArtist: latest.artists?.[0]?.name };
 }
 
-async function getYoutubeStats(channelId) {
-  const url = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${channelId}&key=${process.env.YOUTUBE_API_KEY}`;
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  const data = await res.json();
-  const stats = data.items?.[0]?.statistics;
-  if (!stats) return null;
-  return {
-    viewCount: Number(stats.viewCount || 0),
-    subscriberCount: Number(stats.subscriberCount || 0),
-  };
+// YouTube's channels.list also accepts multiple IDs in one call — same fix
+// as Spotify's batch endpoint, same reason. Returns a Map keyed by channelId.
+async function getYoutubeStatsBatch(channelIds) {
+  const out = new Map();
+  for (const ids of chunk(channelIds, 50)) {
+    const url = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${ids.join(
+      ","
+    )}&key=${process.env.YOUTUBE_API_KEY}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`YouTube batch fetch failed: ${res.status} ${res.statusText}`);
+    const data = await res.json();
+    for (const item of data.items || []) {
+      if (item?.statistics) {
+        out.set(item.id, {
+          viewCount: Number(item.statistics.viewCount || 0),
+          subscriberCount: Number(item.statistics.subscriberCount || 0),
+        });
+      }
+    }
+  }
+  return out;
 }
 
 async function getUpcomingPremieres(channelId) {
@@ -429,23 +463,28 @@ export default async () => {
   // without going so high it risks tripping a provider's own rate limiting.
   const ARTIST_BATCH_SIZE = 20;
 
-  // --- Spotify pre-fetch, its OWN gentle pace ---
-  // Confirmed via a real run: batching 20 artists together meant up to 60
-  // simultaneous Spotify requests (3 calls x 20 artists) — Spotify answered
-  // with 429 Too Many Requests. Spotify's calls now run in their own much
-  // smaller batches, decoupled from how fast Deezer/YouTube/news run, and
-  // get cached here so the main loop below just reads the result.
+  // --- Spotify pre-fetch ---
+  // Popularity/followers now come from ONE bulk call (up to 50 IDs each) —
+  // the real fix, not just gentler pacing. Release/feature detection has no
+  // bulk equivalent in Spotify's API, so those stay per-artist, but in small
+  // batches (their own pace, decoupled from Deezer/YouTube/news below).
   const SPOTIFY_BATCH_SIZE = 4;
   const spotifyCache = new Map();
   if (spotifyToken) {
     const spotifyArtists = artists.filter((a) => a.spotify_id);
-    await processInBatches(spotifyArtists, SPOTIFY_BATCH_SIZE, async (artist) => {
-      const entry = {};
-      try {
-        entry.data = await getSpotifyArtistData(spotifyToken, artist.spotify_id);
-      } catch (e) {
-        logSpotifyErrorOnce(e);
+    try {
+      const batchData = await getSpotifyArtistsBatch(
+        spotifyToken,
+        spotifyArtists.map((a) => a.spotify_id)
+      );
+      for (const artist of spotifyArtists) {
+        spotifyCache.set(artist.id, { data: batchData.get(artist.spotify_id) || null });
       }
+    } catch (e) {
+      logSpotifyErrorOnce(e);
+    }
+    await processInBatches(spotifyArtists, SPOTIFY_BATCH_SIZE, async (artist) => {
+      const entry = spotifyCache.get(artist.id) || {};
       try {
         entry.release = await getLatestRelease(spotifyToken, artist.spotify_id);
       } catch (e) {
@@ -458,6 +497,22 @@ export default async () => {
       }
       spotifyCache.set(artist.id, entry);
     });
+  }
+
+  // --- YouTube pre-fetch — same bulk-call fix ---
+  // Upcoming-premiere detection (search.list) has no bulk equivalent and
+  // stays per-channel inside the main loop; it was never the bottleneck.
+  const youtubeCache = new Map();
+  const youtubeArtists = artists.filter((a) => a.youtube_channel_id);
+  if (youtubeArtists.length) {
+    try {
+      const batchStats = await getYoutubeStatsBatch(youtubeArtists.map((a) => a.youtube_channel_id));
+      for (const artist of youtubeArtists) {
+        youtubeCache.set(artist.id, batchStats.get(artist.youtube_channel_id) || null);
+      }
+    } catch (e) {
+      results.errors.push(e.message);
+    }
   }
 
   async function processArtist(artist) {
@@ -517,9 +572,9 @@ export default async () => {
         }
       }
 
-      // --- YouTube view + subscriber growth -> Momentum ---
+      // --- YouTube view + subscriber growth -> Momentum (pre-fetched above) ---
       if (artist.youtube_channel_id) {
-        const ytStats = await getYoutubeStats(artist.youtube_channel_id);
+        const ytStats = youtubeCache.get(artist.id) || null;
         if (ytStats) {
           if (artist.last_youtube_view_count) {
             const rawDelta = ytStats.viewCount - artist.last_youtube_view_count;
