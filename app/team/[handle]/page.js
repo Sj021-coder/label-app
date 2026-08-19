@@ -1,7 +1,6 @@
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
-import { getTeamLevel, TEAM_MISSION_MIN_CONTRIBUTION_PCT, TEAM_MAX_MEMBERS } from "@/lib/gameRules";
-import { getSharedWeek } from "@/lib/weeklyProgram";
+import { getTeamLevel, TEAM_MAX_MEMBERS } from "@/lib/gameRules";
 import { computeTeamDuelSide } from "@/lib/duels";
 import TeamActions from "./TeamActions";
 
@@ -41,30 +40,6 @@ export default async function TeamPage({ params }) {
   }
   const teamScore = contributions.reduce((s, c) => s + (c.total_score || 0), 0);
   const { level, ceiling, progressPct } = getTeamLevel(teamScore);
-
-  // --- Collective mission: did >= MIN_CONTRIBUTION_PCT of the team show a
-  // real sign of life this week (a Pick'em vote or a transfer)? Not "did
-  // everyone" — a couple of quiet members shouldn't sink the whole team.
-  const { start: weekStart } = getSharedWeek();
-  const activeMemberIds = new Set();
-  if (memberIds.length > 0) {
-    const [{ data: picks }, { data: transfers }] = await Promise.all([
-      supabase
-        .from("prediction_picks")
-        .select("user_id")
-        .in("user_id", memberIds)
-        .gte("created_at", weekStart.toISOString()),
-      supabase
-        .from("roster_entries")
-        .select("user_id")
-        .in("user_id", memberIds)
-        .gte("added_at", weekStart.toISOString()),
-    ]);
-    for (const p of picks || []) activeMemberIds.add(p.user_id);
-    for (const t of transfers || []) activeMemberIds.add(t.user_id);
-  }
-  const missionPct = memberIds.length ? Math.round((activeMemberIds.size / memberIds.length) * 100) : 0;
-  const missionMet = missionPct >= TEAM_MISSION_MIN_CONTRIBUTION_PCT * 100;
 
   // --- Active team duel, if any ---
   // Fetched as raw rows (not an embedded join) — team_duels has TWO foreign
@@ -134,28 +109,6 @@ export default async function TeamPage({ params }) {
         </div>
       </div>
 
-      {/* Collective mission */}
-      <div className="bg-[var(--surface)] border border-[var(--border)] rounded-2xl p-3.5 mb-4">
-        <div className="flex items-center justify-between mb-1.5">
-          <span className="text-[11px] uppercase tracking-wide text-[var(--text-faint)] font-bold">
-            🎯 Mission de la semaine
-          </span>
-          <span className={`text-xs font-bold ${missionMet ? "text-[var(--gold)]" : "text-[var(--text-faint)]"}`}>
-            {missionPct}%
-          </span>
-        </div>
-        <div className="h-2 bg-[var(--surface-2)] rounded-full overflow-hidden mb-1.5">
-          <div
-            className={`h-full ${missionMet ? "bg-[var(--gold)]" : "bg-[var(--violet)]"}`}
-            style={{ width: `${missionPct}%` }}
-          />
-        </div>
-        <p className="text-[11px] text-[var(--text-faint)]">
-          {Math.round(TEAM_MISSION_MIN_CONTRIBUTION_PCT * 100)}% de l&apos;équipe actif cette semaine
-          (pronostic ou transfert) {missionMet ? "— objectif atteint ✓" : "pour valider la mission"}.
-        </p>
-      </div>
-
       {/* Duel status */}
       <div className="bg-[var(--surface)] border border-[var(--violet)]/40 rounded-2xl p-3.5 mb-4">
         <div className="text-[11px] uppercase tracking-wide text-[var(--text-faint)] font-bold mb-2">
@@ -208,33 +161,29 @@ export default async function TeamPage({ params }) {
       {contributions.length === 0 && (
         <div className="text-center text-[var(--text-faint)] text-sm py-6">Personne pour l&apos;instant.</div>
       )}
-      {contributions.map((c) => {
-        const pct = teamScore > 0 ? Math.round(((c.total_score || 0) / teamScore) * 100) : 0;
-        return (
+      {contributions.map((c) => (
+        <div
+          key={c.user_id}
+          className="flex items-center gap-3 px-3 py-2.5 rounded-2xl mb-1.5 border border-[var(--border)]"
+        >
           <div
-            key={c.user_id}
-            className="flex items-center gap-3 px-3 py-2.5 rounded-2xl mb-1.5 border border-[var(--border)]"
+            className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 text-white"
+            style={{ background: team.color }}
           >
-            <div
-              className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 text-white"
-              style={{ background: team.color }}
-            >
-              {c.username.slice(0, 2).toUpperCase()}
-            </div>
-            <div className="flex-1">
-              <div className="text-sm font-semibold">
-                {c.username}
-                {c.user_id === team.owner_id && (
-                  <span className="text-[10px] text-[var(--text-faint)]"> · fondateur</span>
-                )}
-                {user && c.user_id === user.id ? " (toi)" : ""}
-              </div>
-              <div className="text-[10px] text-[var(--text-faint)]">{pct}% de l&apos;équipe</div>
-            </div>
-            <div className="mono text-sm font-bold">{c.total_score} pts</div>
+            {c.username.slice(0, 2).toUpperCase()}
           </div>
-        );
-      })}
+          <div className="flex-1">
+            <div className="text-sm font-semibold">
+              {c.username}
+              {c.user_id === team.owner_id && (
+                <span className="text-[10px] text-[var(--text-faint)]"> · fondateur</span>
+              )}
+              {user && c.user_id === user.id ? " (toi)" : ""}
+            </div>
+          </div>
+          <div className="mono text-sm font-bold">{c.total_score} pts</div>
+        </div>
+      ))}
 
       {isMember && (
         <Link
