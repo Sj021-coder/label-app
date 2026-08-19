@@ -37,11 +37,15 @@ async function getSpotifyToken() {
   return data.access_token;
 }
 
+// Throws (with the real HTTP status) instead of silently returning null on
+// failure — a silent null was exactly why "spotifySynced: 0" had no visible
+// cause anywhere: every call could be failing with the same real error and
+// nothing would ever say so. Callers catch this and surface it once.
 async function getSpotifyArtistData(token, spotifyId) {
   const res = await fetch(`https://api.spotify.com/v1/artists/${spotifyId}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
-  if (!res.ok) return null;
+  if (!res.ok) throw new Error(`Spotify artist fetch failed: ${res.status} ${res.statusText}`);
   const data = await res.json();
   return { popularity: data.popularity ?? null, followers: data.followers?.total ?? null };
 }
@@ -49,7 +53,7 @@ async function getSpotifyArtistData(token, spotifyId) {
 async function getLatestRelease(token, spotifyId) {
   const url = `https://api.spotify.com/v1/artists/${spotifyId}/albums?include_groups=album,single&limit=1&market=FR`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!res.ok) return null;
+  if (!res.ok) throw new Error(`Spotify releases fetch failed: ${res.status} ${res.statusText}`);
   const data = await res.json();
   const latest = data.items?.[0];
   if (!latest) return null;
@@ -64,7 +68,7 @@ async function getLatestFeature(token, spotifyId) {
   // "appears_on" = tracks by OTHER artists that this artist is featured on
   const url = `https://api.spotify.com/v1/artists/${spotifyId}/albums?include_groups=appears_on&limit=1&market=FR`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!res.ok) return null;
+  if (!res.ok) throw new Error(`Spotify features fetch failed: ${res.status} ${res.statusText}`);
   const data = await res.json();
   const latest = data.items?.[0];
   if (!latest) return null;
@@ -339,6 +343,18 @@ export default async () => {
   }
 
   const results = { spotifySynced: 0, youtubeSynced: 0, newsFound: 0, errors: [] };
+  if (!spotifyToken) results.errors.push("Spotify auth failed — see console for the real status code");
+
+  // Dedup so ONE broken Spotify credential doesn't spam the same message
+  // ~100 times (once per artist) — surfaced once, still points at the cause.
+  const spotifyErrorsLogged = new Set();
+  function logSpotifyErrorOnce(e) {
+    const msg = e.message;
+    if (!spotifyErrorsLogged.has(msg)) {
+      spotifyErrorsLogged.add(msg);
+      results.errors.push(msg);
+    }
+  }
 
   // --- Weekly transfer reset (shared calendar, not a personal rolling clock) ---
   // Refills everyone's free_transfers TOGETHER, at the same moment the "team"
@@ -408,12 +424,20 @@ export default async () => {
   // near the end of the list just never got reached). Now runs in batches
   // of BATCH_SIZE concurrently, so total time is roughly (100 / BATCH_SIZE)
   // slow-artists instead of all 100 back to back.
-  const ARTIST_BATCH_SIZE = 12;
+  // 20, not 12: the first real run finished at 57.1s of a 60s ceiling — too
+  // close for comfort. Bigger batches = fewer sequential rounds = more margin,
+  // without going so high it risks tripping a provider's own rate limiting.
+  const ARTIST_BATCH_SIZE = 20;
   async function processArtist(artist) {
     try {
       // --- Spotify popularity + followers -> Momentum ---
       if (spotifyToken && artist.spotify_id) {
-        const spotifyData = await getSpotifyArtistData(spotifyToken, artist.spotify_id);
+        let spotifyData = null;
+        try {
+          spotifyData = await getSpotifyArtistData(spotifyToken, artist.spotify_id);
+        } catch (e) {
+          logSpotifyErrorOnce(e);
+        }
         if (spotifyData) {
           if (spotifyData.popularity !== null) {
             if (artist.last_spotify_popularity !== null && artist.last_spotify_popularity !== undefined) {
@@ -601,7 +625,12 @@ export default async () => {
 
       // --- New release detection -> Activity (the "boom" moment) ---
       if (spotifyToken && artist.spotify_id) {
-        const release = await getLatestRelease(spotifyToken, artist.spotify_id);
+        let release = null;
+        try {
+          release = await getLatestRelease(spotifyToken, artist.spotify_id);
+        } catch (e) {
+          logSpotifyErrorOnce(e);
+        }
         if (release && release.releaseDate) {
           const isNewRelease =
             artist.last_release_date && release.releaseDate > artist.last_release_date;
@@ -635,7 +664,12 @@ export default async () => {
 
       // --- New feature detection ("appears_on") -> Activity ---
       if (spotifyToken && artist.spotify_id) {
-        const feature = await getLatestFeature(spotifyToken, artist.spotify_id);
+        let feature = null;
+        try {
+          feature = await getLatestFeature(spotifyToken, artist.spotify_id);
+        } catch (e) {
+          logSpotifyErrorOnce(e);
+        }
         if (feature && feature.releaseDate) {
           const isNewFeature =
             artist.last_feature_date && feature.releaseDate > artist.last_feature_date;
