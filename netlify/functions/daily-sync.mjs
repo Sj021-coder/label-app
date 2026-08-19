@@ -428,16 +428,43 @@ export default async () => {
   // close for comfort. Bigger batches = fewer sequential rounds = more margin,
   // without going so high it risks tripping a provider's own rate limiting.
   const ARTIST_BATCH_SIZE = 20;
+
+  // --- Spotify pre-fetch, its OWN gentle pace ---
+  // Confirmed via a real run: batching 20 artists together meant up to 60
+  // simultaneous Spotify requests (3 calls x 20 artists) — Spotify answered
+  // with 429 Too Many Requests. Spotify's calls now run in their own much
+  // smaller batches, decoupled from how fast Deezer/YouTube/news run, and
+  // get cached here so the main loop below just reads the result.
+  const SPOTIFY_BATCH_SIZE = 4;
+  const spotifyCache = new Map();
+  if (spotifyToken) {
+    const spotifyArtists = artists.filter((a) => a.spotify_id);
+    await processInBatches(spotifyArtists, SPOTIFY_BATCH_SIZE, async (artist) => {
+      const entry = {};
+      try {
+        entry.data = await getSpotifyArtistData(spotifyToken, artist.spotify_id);
+      } catch (e) {
+        logSpotifyErrorOnce(e);
+      }
+      try {
+        entry.release = await getLatestRelease(spotifyToken, artist.spotify_id);
+      } catch (e) {
+        logSpotifyErrorOnce(e);
+      }
+      try {
+        entry.feature = await getLatestFeature(spotifyToken, artist.spotify_id);
+      } catch (e) {
+        logSpotifyErrorOnce(e);
+      }
+      spotifyCache.set(artist.id, entry);
+    });
+  }
+
   async function processArtist(artist) {
     try {
-      // --- Spotify popularity + followers -> Momentum ---
+      // --- Spotify popularity + followers -> Momentum (pre-fetched above) ---
       if (spotifyToken && artist.spotify_id) {
-        let spotifyData = null;
-        try {
-          spotifyData = await getSpotifyArtistData(spotifyToken, artist.spotify_id);
-        } catch (e) {
-          logSpotifyErrorOnce(e);
-        }
+        const spotifyData = spotifyCache.get(artist.id)?.data || null;
         if (spotifyData) {
           if (spotifyData.popularity !== null) {
             if (artist.last_spotify_popularity !== null && artist.last_spotify_popularity !== undefined) {
@@ -623,14 +650,9 @@ export default async () => {
         }
       }
 
-      // --- New release detection -> Activity (the "boom" moment) ---
+      // --- New release detection -> Activity (pre-fetched above) ---
       if (spotifyToken && artist.spotify_id) {
-        let release = null;
-        try {
-          release = await getLatestRelease(spotifyToken, artist.spotify_id);
-        } catch (e) {
-          logSpotifyErrorOnce(e);
-        }
+        const release = spotifyCache.get(artist.id)?.release || null;
         if (release && release.releaseDate) {
           const isNewRelease =
             artist.last_release_date && release.releaseDate > artist.last_release_date;
@@ -662,14 +684,9 @@ export default async () => {
         }
       }
 
-      // --- New feature detection ("appears_on") -> Activity ---
+      // --- New feature detection ("appears_on") -> Activity (pre-fetched above) ---
       if (spotifyToken && artist.spotify_id) {
-        let feature = null;
-        try {
-          feature = await getLatestFeature(spotifyToken, artist.spotify_id);
-        } catch (e) {
-          logSpotifyErrorOnce(e);
-        }
+        const feature = spotifyCache.get(artist.id)?.feature || null;
         if (feature && feature.releaseDate) {
           const isNewFeature =
             artist.last_feature_date && feature.releaseDate > artist.last_feature_date;
