@@ -244,7 +244,19 @@ function buildValueReason(artist) {
   return labels[cat]?.[val > 0 ? "up" : "down"] || null;
 }
 
-async function applyScoreEvent(supabase, artist, category, delta, label, eventKey, poolAverage) {
+// Runs `fn` over `items` in concurrent batches instead of one at a time.
+// This is the real fix for the function timing out: ~100 artists x several
+// sequential API calls each was taking minutes done serially. Batches of
+// BATCH_SIZE run concurrently, so wall time is roughly (count / batchSize)
+// slow-artists instead of ALL of them, one after another.
+async function processInBatches(items, batchSize, fn) {
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    await Promise.all(batch.map(fn));
+  }
+}
+
+async function applyScoreEvent(supabase, artist, category, delta, label, eventKey, poolAverage, seasonId) {
   if (delta === 0) return 0;
 
   // Anti-dominance: artists already far above the pool average get less
@@ -288,12 +300,6 @@ async function applyScoreEvent(supabase, artist, category, delta, label, eventKe
   artist.culture_score = subtotals.culture_score;
   artist.score = weighted;
 
-  const { data: activeSeason } = await supabase
-    .from("seasons")
-    .select("id")
-    .eq("is_active", true)
-    .single();
-
   const dampedNote = effectiveDelta !== delta ? " (dominance-dampened)" : "";
   await supabase.from("score_events").insert({
     artist_id: artist.id,
@@ -301,7 +307,7 @@ async function applyScoreEvent(supabase, artist, category, delta, label, eventKe
     label: label + dampedNote,
     delta: effectiveDelta,
     category,
-    season_id: activeSeason?.id || null,
+    season_id: seasonId || null,
     created_by: null, // automated, no admin user
   });
 
@@ -341,13 +347,13 @@ export default async () => {
   const now = new Date();
   if (now.getUTCDay() === 1 && now.getUTCHours() < 12) {
     const { data: profiles } = await supabase.from("profiles").select("id, free_transfers");
-    for (const p of profiles || []) {
+    await processInBatches(profiles || [], 25, async (p) => {
       const refreshed = Math.min((p.free_transfers || 0) + TRANSFER_FREE_PER_WEEK, TRANSFER_BANK_CAP);
       await supabase
         .from("profiles")
         .update({ free_transfers: refreshed, last_transfer_refresh: now.toISOString().slice(0, 10) })
         .eq("id", p.id);
-    }
+    });
     results.transfersReset = (profiles || []).length;
   }
 
@@ -356,12 +362,22 @@ export default async () => {
   const poolAverage =
     artists.reduce((sum, a) => sum + (a.score || 0), 0) / (artists.length || 1);
 
+  // Fetched ONCE per run now, not once per event (used to be a DB round trip
+  // on every single applyScoreEvent call — up to hundreds per run).
+  const { data: activeSeason } = await supabase
+    .from("seasons")
+    .select("id")
+    .eq("is_active", true)
+    .single();
+  const seasonId = activeSeason?.id || null;
+
   // --- Event decay pass ---
   // Every category subtotal fades slightly each run unless reinforced by a
   // new real event this run. This stops an artist's score from being
   // permanently inflated by something that happened months ago — momentum
-  // has to be sustained, not just accumulated once.
-  for (const artist of artists) {
+  // has to be sustained, not just accumulated once. Batched (not one artist
+  // at a time) — same fix as the main loop below.
+  await processInBatches(artists, 20, async (artist) => {
     const decayed = {
       momentum_score: Math.round((artist.momentum_score || 0) * (1 - RULES.DECAY_RATE)),
       performance_score: Math.round((artist.performance_score || 0) * (1 - RULES.DECAY_RATE)),
@@ -383,9 +399,17 @@ export default async () => {
     artist._performanceAtRunStart = decayed.performance_score;
     artist._activityAtRunStart = decayed.activity_score;
     artist._cultureAtRunStart = decayed.culture_score;
-  }
+  });
 
-  for (const artist of artists) {
+  // The real timeout fix: was `for (const artist of artists) { await ... }`,
+  // fully sequential — ~100 artists x several awaited API calls each took
+  // multiple minutes and got killed mid-run by Netlify's execution limit
+  // every single time (silent — no artist ever got a real error, the ones
+  // near the end of the list just never got reached). Now runs in batches
+  // of BATCH_SIZE concurrently, so total time is roughly (100 / BATCH_SIZE)
+  // slow-artists instead of all 100 back to back.
+  const ARTIST_BATCH_SIZE = 12;
+  async function processArtist(artist) {
     try {
       // --- Spotify popularity + followers -> Momentum ---
       if (spotifyToken && artist.spotify_id) {
@@ -404,7 +428,8 @@ export default async () => {
                     ? `🔥 Trending up on Spotify (+${delta})`
                     : `📉 Cooling off on Spotify (${delta})`,
                   "stream_tick",
-                  poolAverage
+                  poolAverage,
+                  seasonId
                 );
                 results.spotifySynced++;
               }
@@ -424,7 +449,8 @@ export default async () => {
                     ? `👥 Gaining new Spotify followers`
                     : `👥 Losing some Spotify followers`,
                   "stream_tick",
-                  poolAverage
+                  poolAverage,
+                  seasonId
                 );
               }
             }
@@ -457,7 +483,8 @@ export default async () => {
                   ? `▶️ YouTube views climbing fast`
                   : `▶️ YouTube views slowing down`,
                 "view_spike",
-                poolAverage
+                poolAverage,
+                seasonId
               );
               results.youtubeSynced++;
             }
@@ -475,7 +502,8 @@ export default async () => {
                   ? `🔔 New YouTube subscribers coming in`
                   : `🔔 YouTube subscriber growth slowing`,
                 "view_spike",
-                poolAverage
+                poolAverage,
+                seasonId
               );
             }
           }
@@ -538,7 +566,8 @@ export default async () => {
                   scaledDelta,
                   scaledDelta > 0 ? `🎧 Growing on Deezer` : `🎧 Slowing on Deezer`,
                   "stream_tick",
-                  poolAverage
+                  poolAverage,
+                  seasonId
                 );
               }
             }
@@ -560,7 +589,8 @@ export default async () => {
                     ? `📈 "${topTrack.trackName}" climbing on Deezer`
                     : `📉 "${topTrack.trackName}" fading on Deezer`,
                   "chart_up",
-                  poolAverage
+                  poolAverage,
+                  seasonId
                 );
               }
             }
@@ -588,7 +618,8 @@ export default async () => {
                 ? `💿 New album dropped: "${release.name}"`
                 : `🎵 New single dropped: "${release.name}"`,
               release.type === "album" ? "label_deal" : "feature",
-              poolAverage
+              poolAverage,
+              seasonId
             );
             results.releasesDetected = (results.releasesDetected || 0) + 1;
           }
@@ -618,7 +649,8 @@ export default async () => {
               10,
               `🤝 New feature: "${feature.name}"${feature.byArtist ? ` with ${feature.byArtist}` : ""}`,
               "feature",
-              poolAverage
+              poolAverage,
+              seasonId
             );
             results.featuresDetected = (results.featuresDetected || 0) + 1;
           }
@@ -693,7 +725,8 @@ export default async () => {
               5,
               `🏆 Passed ${threshold} points!`,
               "viral",
-              poolAverage
+              poolAverage,
+              seasonId
             );
             results.milestonesHit = (results.milestonesHit || 0) + 1;
           }
@@ -704,6 +737,8 @@ export default async () => {
       results.errors.push(`${artist.name}: ${e.message}`);
     }
   }
+
+  await processInBatches(artists, ARTIST_BATCH_SIZE, processArtist);
 
   // --- General rap news ticker (Booska-P feed, not tied to one artist) ---
   // Feeds the Radar's "Actu rap" block — the holistic, non-artist-specific
