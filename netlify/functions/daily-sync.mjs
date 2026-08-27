@@ -334,6 +334,21 @@ async function applyScoreEvent(supabase, artist, category, delta, label, eventKe
       subtotals.culture_score * 0.1
   );
 
+  // Log written FIRST, current-state snapshot SECOND — deliberately flipped
+  // from the original order. If the snapshot write below ever fails, the
+  // real event history is still intact and reconcilable; the old order
+  // risked the opposite: a changed number with zero paper trail anywhere.
+  const dampedNote = effectiveDelta !== delta ? " (dominance-dampened)" : "";
+  await supabase.from("score_events").insert({
+    artist_id: artist.id,
+    event_key: eventKey,
+    label: label + dampedNote,
+    delta: effectiveDelta,
+    category,
+    season_id: seasonId || null,
+    created_by: null, // automated, no admin user
+  });
+
   await supabase
     .from("artists")
     .update({ ...subtotals, score: weighted })
@@ -348,46 +363,43 @@ async function applyScoreEvent(supabase, artist, category, delta, label, eventKe
   artist.culture_score = subtotals.culture_score;
   artist.score = weighted;
 
-  const dampedNote = effectiveDelta !== delta ? " (dominance-dampened)" : "";
-  await supabase.from("score_events").insert({
-    artist_id: artist.id,
-    event_key: eventKey,
-    label: label + dampedNote,
-    delta: effectiveDelta,
-    category,
-    season_id: seasonId || null,
-    created_by: null, // automated, no admin user
-  });
-
   return effectiveDelta;
 }
 
 export default async () => {
+  // Captured before anything else so a run that fails in the first
+  // millisecond still gets a real started_at in sync_runs, not a gap.
+  const startedAt = new Date();
   const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY
   );
 
-  const { data: artists, error } = await supabase
-    .from("artists")
-    .select(
-      "id, name, cost, value, spotify_id, youtube_channel_id, deezer_id, image_url, momentum_score, performance_score, activity_score, culture_score, last_spotify_popularity, last_spotify_followers, last_youtube_view_count, last_youtube_subscribers, last_release_date, last_release_name, last_feature_date, last_deezer_fans, last_deezer_rank"
-    );
-
-  if (error) {
-    console.error("Failed to load artists:", error.message);
-    return new Response("Failed", { status: 500 });
-  }
-
-  let spotifyToken = null;
-  try {
-    spotifyToken = await getSpotifyToken();
-  } catch (e) {
-    console.error("Spotify auth failed, skipping Spotify sync:", e.message);
-  }
-
+  // Declared here (not inside the try below) so both the success path AND
+  // the catch block can attach whatever was already collected before a
+  // crash — a fatal error halfway through still reports partial results
+  // instead of nothing, and sync_runs always gets written either way.
   const results = { spotifySynced: 0, youtubeSynced: 0, newsFound: 0, errors: [] };
-  if (!spotifyToken) results.errors.push("Spotify auth failed — see console for the real status code");
+
+  try {
+    const { data: artists, error } = await supabase
+      .from("artists")
+      .select(
+        "id, name, cost, value, spotify_id, youtube_channel_id, deezer_id, image_url, momentum_score, performance_score, activity_score, culture_score, last_spotify_popularity, last_spotify_followers, last_youtube_view_count, last_youtube_subscribers, last_release_date, last_release_name, last_feature_date, last_deezer_fans, last_deezer_rank"
+      );
+
+    if (error) {
+      throw new Error(`Failed to load artists: ${error.message}`);
+    }
+
+    let spotifyToken = null;
+    try {
+      spotifyToken = await getSpotifyToken();
+    } catch (e) {
+      console.error("Spotify auth failed, skipping Spotify sync:", e.message);
+    }
+
+    if (!spotifyToken) results.errors.push("Spotify auth failed — see console for the real status code");
 
   // Dedup so ONE broken Spotify credential doesn't spam the same message
   // ~100 times (once per artist) — surfaced once, still points at the cause.
@@ -923,11 +935,45 @@ export default async () => {
     results.errors.push(`weekly award: ${e.message}`);
   }
 
-  console.log("Daily sync complete:", JSON.stringify(results));
-  return new Response(JSON.stringify(results), {
-    headers: { "Content-Type": "application/json" },
-  });
+    console.log("Daily sync complete:", JSON.stringify(results));
+    await logSyncRun(supabase, startedAt, true, results);
+    return new Response(JSON.stringify(results), {
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    // A fatal, unexpected error anywhere above lands here. The run still
+    // gets logged — as a failure, with whatever partial results were
+    // collected before the crash — so a broken run shows up red on the
+    // Admin health card instead of just silently never finishing.
+    results.errors.push(`FATAL: ${e.message}`);
+    console.error("Daily sync FAILED:", e.message);
+    await logSyncRun(supabase, startedAt, false, results);
+    return new Response(JSON.stringify({ ...results, fatal: e.message }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
 };
+
+// Writes one row per run, success or failure, so the Admin health card can
+// show "is the engine actually alive" at a glance instead of everyone just
+// hoping the twice-daily cron fired. Wrapped in its own try/catch — a
+// logging failure must never be what makes the whole function report broken.
+async function logSyncRun(supabase, startedAt, success, results) {
+  const finishedAt = new Date();
+  try {
+    await supabase.from("sync_runs").insert({
+      started_at: startedAt.toISOString(),
+      finished_at: finishedAt.toISOString(),
+      duration_ms: finishedAt.getTime() - startedAt.getTime(),
+      success,
+      errors: results.errors || [],
+      results,
+    });
+  } catch (e) {
+    console.error("Failed to log sync_runs (non-fatal):", e.message);
+  }
+}
 
 export const config = {
   schedule: "0 8,20 * * *", // twice daily: 8am and 8pm UTC

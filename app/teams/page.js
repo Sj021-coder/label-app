@@ -5,25 +5,18 @@ import { getTeamLevel } from "@/lib/gameRules";
 export default async function TeamsLeaderboardPage() {
   const supabase = await createClient();
 
-  const [{ data: teams }, { data: memberRows }, { data: totals }] = await Promise.all([
-    supabase.from("teams").select("id, handle, name, color"),
-    supabase.from("team_members").select("team_id, user_id"),
-    supabase.from("user_totals").select("user_id, total_score"),
-  ]);
+  // One query against `team_totals` (a DB view, same pattern as
+  // `user_totals`) instead of 3 separate queries stitched together in JS —
+  // the score shown here can never drift from the real, live source of truth.
+  const { data: teams } = await supabase
+    .from("team_totals")
+    .select("team_id, handle, name, color, member_count, team_score")
+    .order("team_score", { ascending: false });
 
-  const scoreByUser = Object.fromEntries((totals || []).map((t) => [t.user_id, t.total_score || 0]));
-  const membersByTeam = {};
-  for (const m of memberRows || []) {
-    (membersByTeam[m.team_id] ||= []).push(m.user_id);
-  }
-
-  const ranked = (teams || [])
-    .map((t) => {
-      const memberIds = membersByTeam[t.id] || [];
-      const score = memberIds.reduce((s, uid) => s + (scoreByUser[uid] || 0), 0);
-      return { ...t, score, memberCount: memberIds.length, level: getTeamLevel(score).level };
-    })
-    .sort((a, b) => b.score - a.score);
+  const ranked = (teams || []).map((t) => ({
+    ...t,
+    level: getTeamLevel(t.team_score).level,
+  }));
 
   return (
     <div className="min-h-screen px-5 pt-8 pb-10 max-w-md mx-auto">
@@ -40,7 +33,7 @@ export default async function TeamsLeaderboardPage() {
 
       {ranked.map((t, i) => (
         <Link
-          key={t.id}
+          key={t.team_id}
           href={`/team/${t.handle}`}
           className="flex items-center gap-3 px-3 py-2.5 rounded-2xl mb-1.5 border border-[var(--border)] bg-[var(--surface)]"
         >
@@ -54,10 +47,10 @@ export default async function TeamsLeaderboardPage() {
           <div className="flex-1">
             <div className="text-sm font-semibold">{t.name}</div>
             <div className="text-[10px] text-[var(--text-faint)]">
-              Niv. {t.level} · {t.memberCount} membre{t.memberCount > 1 ? "s" : ""}
+              Niv. {t.level} · {t.member_count} membre{t.member_count > 1 ? "s" : ""}
             </div>
           </div>
-          <div className="mono text-sm font-bold text-[var(--gold)]">{t.score} pts</div>
+          <div className="mono text-sm font-bold text-[var(--gold)]">{t.team_score} pts</div>
         </Link>
       ))}
     </div>

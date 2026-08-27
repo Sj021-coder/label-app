@@ -3,20 +3,45 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 
+// Unmapped artists first (nothing to gain re-checking an already-mapped
+// one), then by tier (S/A matter most — they're who most people draft and
+// who the automated engine has the biggest impact on), alphabetical within
+// a tier. Was plain alphabetical order before, which buried the highest-
+// priority unmapped Tier S/A artists anywhere in a 100-artist list.
+const TIER_PRIORITY = { S: 0, A: 1, B: 2, C: 3 };
+function prioritize(artists) {
+  return [...artists].sort((a, b) => {
+    const aMapped = !!(a.spotify_id || a.youtube_channel_id);
+    const bMapped = !!(b.spotify_id || b.youtube_channel_id);
+    if (aMapped !== bMapped) return aMapped ? 1 : -1;
+    const aTier = TIER_PRIORITY[a.tier] ?? 4;
+    const bTier = TIER_PRIORITY[b.tier] ?? 4;
+    if (aTier !== bTier) return aTier - bTier;
+    return a.name.localeCompare(b.name);
+  });
+}
+
 export default function AdminMapping({ artists, newsItems }) {
-  const [selectedId, setSelectedId] = useState(artists[0]?.id || "");
+  const prioritized = prioritize(artists);
+  const [selectedId, setSelectedId] = useState(prioritized[0]?.id || "");
   const [spotifyResults, setSpotifyResults] = useState([]);
   const [youtubeResults, setYoutubeResults] = useState([]);
   const [loadingSpotify, setLoadingSpotify] = useState(false);
   const [loadingYoutube, setLoadingYoutube] = useState(false);
   const [error, setError] = useState("");
   const [filter, setFilter] = useState("");
+  const [manualSpotifyId, setManualSpotifyId] = useState("");
+  const [manualYoutubeId, setManualYoutubeId] = useState("");
   const router = useRouter();
 
   const selected = artists.find((a) => a.id === selectedId);
-  const filtered = artists.filter((a) =>
+  const filtered = prioritized.filter((a) =>
     a.name.toLowerCase().includes(filter.toLowerCase())
   );
+
+  const unmappedPriority = artists.filter(
+    (a) => !a.spotify_id && !a.youtube_channel_id && (a.tier === "S" || a.tier === "A")
+  ).length;
 
   async function searchSpotify() {
     setError("");
@@ -61,6 +86,7 @@ export default function AdminMapping({ artists, newsItems }) {
       body: JSON.stringify({ artistId: selectedId, spotifyId }),
     });
     setSpotifyResults([]);
+    setManualSpotifyId("");
     router.refresh();
   }
 
@@ -71,6 +97,7 @@ export default function AdminMapping({ artists, newsItems }) {
       body: JSON.stringify({ artistId: selectedId, youtubeChannelId }),
     });
     setYoutubeResults([]);
+    setManualYoutubeId("");
     router.refresh();
   }
 
@@ -87,8 +114,21 @@ export default function AdminMapping({ artists, newsItems }) {
 
   return (
     <div>
-      <p className="text-xs text-[var(--text-faint)] mb-3">
+      <p className="text-xs text-[var(--text-faint)] mb-1">
         {mappedCount}/{artists.length} artistes ont au moins un ID assigné.
+      </p>
+      <p className="text-xs mb-3">
+        {unmappedPriority > 0 ? (
+          <span className="text-[var(--crimson)] font-bold">
+            ⚠️ {unmappedPriority} artiste{unmappedPriority > 1 ? "s" : ""} prioritaire
+            {unmappedPriority > 1 ? "s" : ""} (Tier S/A) sans ID — la liste ci-dessous les
+            place en premier.
+          </span>
+        ) : (
+          <span className="text-[var(--gold)] font-bold">
+            ✅ Tous les artistes Tier S/A sont mappés.
+          </span>
+        )}
       </p>
 
       <input
@@ -104,12 +144,14 @@ export default function AdminMapping({ artists, newsItems }) {
           setSelectedId(e.target.value);
           setSpotifyResults([]);
           setYoutubeResults([]);
+          setManualSpotifyId("");
+          setManualYoutubeId("");
         }}
         className="w-full bg-[var(--surface)] border border-[var(--border)] rounded-xl px-3 py-2.5 text-sm mb-3"
       >
         {filtered.map((a) => (
           <option key={a.id} value={a.id}>
-            {a.name} {a.spotify_id ? "🎵" : ""} {a.youtube_channel_id ? "▶️" : ""}
+            [{a.tier || "?"}] {a.name} {a.spotify_id ? "🎵" : ""} {a.youtube_channel_id ? "▶️" : ""}
           </option>
         ))}
       </select>
@@ -131,6 +173,48 @@ export default function AdminMapping({ artists, newsItems }) {
         >
           {loadingYoutube ? "..." : "Chercher sur YouTube"}
         </button>
+      </div>
+
+      {/* Manual paste — for when the search above returns decoys (fan
+          channels, tribute accounts, unrelated artists with the same
+          stage name) instead of the real one. Same save-artist-ids
+          endpoint as clicking a search result, just a direct ID instead. */}
+      <div className="bg-[var(--surface)] border border-[var(--border)] rounded-xl p-3 mb-3">
+        <div className="text-[11px] text-[var(--text-faint)] uppercase font-bold mb-2">
+          Ou coller un ID vérifié directement
+        </div>
+        <div className="flex gap-1.5 mb-1.5">
+          <input
+            type="text"
+            placeholder="Spotify artist ID"
+            value={manualSpotifyId}
+            onChange={(e) => setManualSpotifyId(e.target.value.trim())}
+            className="flex-1 bg-[var(--surface-2)] border border-[var(--border)] rounded-lg px-2.5 py-1.5 text-xs"
+          />
+          <button
+            onClick={() => manualSpotifyId && assignSpotify(manualSpotifyId)}
+            disabled={!manualSpotifyId}
+            className="text-[11px] font-bold px-3 rounded-lg bg-[var(--gold-soft)] text-[var(--gold)] disabled:opacity-40"
+          >
+            OK
+          </button>
+        </div>
+        <div className="flex gap-1.5">
+          <input
+            type="text"
+            placeholder="YouTube channel ID (UC...)"
+            value={manualYoutubeId}
+            onChange={(e) => setManualYoutubeId(e.target.value.trim())}
+            className="flex-1 bg-[var(--surface-2)] border border-[var(--border)] rounded-lg px-2.5 py-1.5 text-xs"
+          />
+          <button
+            onClick={() => manualYoutubeId && assignYoutube(manualYoutubeId)}
+            disabled={!manualYoutubeId}
+            className="text-[11px] font-bold px-3 rounded-lg bg-[var(--gold-soft)] text-[var(--gold)] disabled:opacity-40"
+          >
+            OK
+          </button>
+        </div>
       </div>
 
       {spotifyResults.length > 0 && (

@@ -4,6 +4,7 @@ import AdminForm from "./AdminForm";
 import AdminPickem from "./AdminPickem";
 import AdminMapping from "./AdminMapping";
 import MetricsPanel from "./MetricsPanel";
+import SyncHealthCard from "./SyncHealthCard";
 
 export default async function AdminPage() {
   // 🔒 Admin gate: only a profile with is_admin = true may see this page.
@@ -34,8 +35,14 @@ export default async function AdminPage() {
 
   const { data: artists } = await supabase
     .from("artists")
-    .select("id, name, initials, color, score, spotify_id, youtube_channel_id")
+    .select("id, name, initials, color, score, tier, spotify_id, youtube_channel_id")
     .order("name");
+
+  const { data: syncRuns } = await supabase
+    .from("sync_runs")
+    .select("id, started_at, duration_ms, success, errors")
+    .order("started_at", { ascending: false })
+    .limit(12);
 
   const { data: predictions } = await supabase
     .from("predictions")
@@ -114,14 +121,21 @@ export default async function AdminPage() {
   return (
     <div>
       <div className="text-[13px] uppercase tracking-wide text-[var(--text-faint)] font-bold mb-3">
-        Métriques
+        Santé du moteur
       </div>
-      <MetricsPanel
-        accounts={accounts}
-        drafted={drafted}
-        captains={captains}
-        shares={shares}
-      />
+      <SyncHealthCard runs={syncRuns || []} />
+
+      <div className="mt-10 pt-6 border-t border-[var(--border)]">
+        <div className="text-[13px] uppercase tracking-wide text-[var(--text-faint)] font-bold mb-3">
+          Métriques
+        </div>
+        <MetricsPanel
+          accounts={accounts}
+          drafted={drafted}
+          captains={captains}
+          shares={shares}
+        />
+      </div>
 
       <div className="mt-10 pt-6 border-t border-[var(--border)]">
         <div className="text-[13px] uppercase tracking-wide text-[var(--text-faint)] font-bold mb-3">

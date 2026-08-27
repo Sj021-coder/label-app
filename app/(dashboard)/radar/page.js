@@ -1,5 +1,6 @@
 import { createClient } from "@/lib/supabase/server";
 import ArtistFace from "@/components/ArtistFace";
+import LiveRefresh from "@/components/LiveRefresh";
 
 export default async function RadarPage() {
   const supabase = await createClient();
@@ -59,6 +60,12 @@ export default async function RadarPage() {
 
   return (
     <div>
+      {/* No visible UI — just re-fetches this page's real data the moment
+          the next sync run writes a new artist score, same "live" feel
+          Roster already has, without duplicating all the queries above
+          into client-side JS. */}
+      <LiveRefresh table="artists" event="UPDATE" channelName="radar-live" />
+
       <div className="text-center pt-2 pb-4">
         <div className="display text-2xl mb-1">
           Release <span className="text-[var(--gold)]">Radar</span>
