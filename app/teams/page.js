@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { getTeamLevel } from "@/lib/gameRules";
+import LiveRefresh from "@/components/LiveRefresh";
 
 export default async function TeamsLeaderboardPage() {
   const supabase = await createClient();
@@ -20,6 +21,8 @@ export default async function TeamsLeaderboardPage() {
 
   return (
     <div className="min-h-screen px-5 pt-8 pb-10 max-w-md mx-auto">
+      <LiveRefresh table="artists" event="UPDATE" channelName="teams-leaderboard-live" />
+
       <div className="text-center mb-6">
         <div className="display text-2xl mb-1">Classement des équipes</div>
         <p className="text-[var(--text-faint)] text-sm">Score cumulé de tous les membres.</p>

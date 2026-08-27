@@ -1,6 +1,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { computeUserDuelSide } from "@/lib/duels";
 import StartUserDuel from "./StartUserDuel";
+import LiveRefresh from "@/components/LiveRefresh";
 
 export default async function UserDuelPage() {
   const supabase = await createClient();
@@ -55,6 +56,8 @@ export default async function UserDuelPage() {
 
   return (
     <div>
+      <LiveRefresh table="artists" event="UPDATE" channelName="user-duel-live" />
+
       <div className="display text-2xl mb-1">⚔️ Duel</div>
       <p className="text-[var(--text-faint)] text-sm mb-6">Micro-comparaison, juste toi vs eux.</p>
 

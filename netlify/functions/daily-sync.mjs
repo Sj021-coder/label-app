@@ -334,25 +334,28 @@ async function applyScoreEvent(supabase, artist, category, delta, label, eventKe
       subtotals.culture_score * 0.1
   );
 
-  // Log written FIRST, current-state snapshot SECOND — deliberately flipped
-  // from the original order. If the snapshot write below ever fails, the
-  // real event history is still intact and reconcilable; the old order
-  // risked the opposite: a changed number with zero paper trail anywhere.
+  // Both writes happen inside ONE Postgres transaction via this RPC call —
+  // either the log entry AND the snapshot update both land, or neither
+  // does. Closes the non-atomic dual-write gap the pipeline audit flagged:
+  // before, these were two separate network calls and a failure between
+  // them could leave the log and the current-state number silently
+  // diverged. The scoring math itself still lives here in JS, in one place
+  // — the SQL function just writes the two already-computed results together.
   const dampedNote = effectiveDelta !== delta ? " (dominance-dampened)" : "";
-  await supabase.from("score_events").insert({
-    artist_id: artist.id,
-    event_key: eventKey,
-    label: label + dampedNote,
-    delta: effectiveDelta,
-    category,
-    season_id: seasonId || null,
-    created_by: null, // automated, no admin user
+  const { error: rpcError } = await supabase.rpc("apply_score_event_atomic", {
+    p_artist_id: artist.id,
+    p_event_key: eventKey,
+    p_label: label + dampedNote,
+    p_delta: effectiveDelta,
+    p_category: category,
+    p_season_id: seasonId || null,
+    p_momentum_score: subtotals.momentum_score,
+    p_performance_score: subtotals.performance_score,
+    p_activity_score: subtotals.activity_score,
+    p_culture_score: subtotals.culture_score,
+    p_score: weighted,
   });
-
-  await supabase
-    .from("artists")
-    .update({ ...subtotals, score: weighted })
-    .eq("id", artist.id);
+  if (rpcError) throw new Error(`apply_score_event_atomic failed for ${artist.id}: ${rpcError.message}`);
 
   // Mutate the in-memory artist object so a SECOND event applied to the
   // same artist later in this same run builds on the updated subtotal,

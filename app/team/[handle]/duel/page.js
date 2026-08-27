@@ -2,6 +2,7 @@ import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { computeTeamDuelSide } from "@/lib/duels";
 import StartTeamDuel from "./StartTeamDuel";
+import LiveRefresh from "@/components/LiveRefresh";
 
 export default async function TeamDuelPage({ params }) {
   const { handle } = await params;
@@ -75,6 +76,8 @@ export default async function TeamDuelPage({ params }) {
 
   return (
     <div className="min-h-screen px-5 pt-8 pb-10 max-w-md mx-auto">
+      <LiveRefresh table="artists" event="UPDATE" channelName={`team-duel-live-${team.id}`} />
+
       <Link href={`/team/${team.handle}`} className="text-xs text-[var(--text-faint)] mb-4 inline-block">
         ← {team.name}
       </Link>

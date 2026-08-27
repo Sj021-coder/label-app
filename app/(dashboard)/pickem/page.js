@@ -2,6 +2,7 @@ import { createClient } from "@/lib/supabase/server";
 import { PICKEM_STAKE } from "@/lib/gameRules";
 import PickemClient from "./PickemClient";
 import WeeklyDigest from "./WeeklyDigest";
+import LiveRefresh from "@/components/LiveRefresh";
 
 export default async function PickemPage() {
   const supabase = await createClient();
@@ -62,6 +63,9 @@ export default async function PickemPage() {
 
   return (
     <div>
+      <LiveRefresh table="artists" event="UPDATE" channelName="pickem-live-artists" />
+      <LiveRefresh table="predictions" event="UPDATE" channelName="pickem-live-predictions" />
+
       <WeeklyDigest movers={movers} upcoming={upcoming || []} news={news || []} />
       <PickemClient
         predictions={predictions || []}

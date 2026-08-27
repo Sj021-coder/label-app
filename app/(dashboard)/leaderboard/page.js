@@ -1,4 +1,5 @@
 import { createClient } from "@/lib/supabase/server";
+import LiveRefresh from "@/components/LiveRefresh";
 
 export default async function LeaderboardPage() {
   const supabase = await createClient();
@@ -13,6 +14,8 @@ export default async function LeaderboardPage() {
 
   return (
     <div>
+      <LiveRefresh table="artists" event="UPDATE" channelName="leaderboard-live" />
+
       <div className="text-[13px] uppercase tracking-wide text-[var(--text-faint)] font-bold mb-3">
         Classement global
       </div>
