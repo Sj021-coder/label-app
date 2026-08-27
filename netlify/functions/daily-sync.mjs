@@ -60,18 +60,34 @@ function chunk(arr, size) {
 // endpoint accepts up to 50 IDs in ONE call. ~40 individual calls become 1.
 // Returns a Map keyed by spotifyId — missing/invalid IDs are simply absent.
 async function getSpotifyArtistsBatch(token, spotifyIds) {
-  const out = new Map();
-  for (const ids of chunk(spotifyIds, 50)) {
-    const res = await fetch(`https://api.spotify.com/v1/artists?ids=${ids.join(",")}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!res.ok) throw new Error(`Spotify batch fetch failed: ${res.status} ${res.statusText}`);
-    const data = await res.json();
-    for (const a of data.artists || []) {
-      if (a) out.set(a.id, { popularity: a.popularity ?? null, followers: a.followers?.total ?? null });
+  // Now that the mapped pool has crossed 50 artists (Aug 2026 mapping push),
+  // this is 2+ sequential calls, not always 1. Two real bugs that only
+  // start to matter at that point, both fixed here:
+  // 1. No pause between chunks — added one, since a burst of 2 calls back
+  //    to back is exactly the kind of thing Spotify's per-time-window limit
+  //    (confirmed real elsewhere in this file) can flag.
+  // 2. The old version threw on the FIRST failing chunk, which discarded
+  //    data ALREADY fetched from an earlier, successful chunk. Now each
+  //    chunk fails independently — a bad chunk 2 no longer erases chunk 1.
+  const data = new Map();
+  const errors = [];
+  const chunks = chunk(spotifyIds, 50);
+  for (let i = 0; i < chunks.length; i++) {
+    try {
+      const res = await fetch(`https://api.spotify.com/v1/artists?ids=${chunks[i].join(",")}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new Error(`Spotify batch fetch failed: ${res.status} ${res.statusText}`);
+      const json = await res.json();
+      for (const a of json.artists || []) {
+        if (a) data.set(a.id, { popularity: a.popularity ?? null, followers: a.followers?.total ?? null });
+      }
+    } catch (e) {
+      errors.push(e);
     }
+    if (i < chunks.length - 1) await sleep(300);
   }
-  return out;
+  return { data, errors };
 }
 
 async function getLatestRelease(token, spotifyId) {
@@ -495,21 +511,22 @@ export default async () => {
   // a real run: even 4-at-a-time still got 429'd, meaning the real limit is
   // requests-PER-TIME, not requests-in-flight — so this is now small batches
   // (2) AND paced with a real pause between them, not just lower concurrency.
+  // Delay bumped 400ms -> 700ms (Aug 2026): the mapped pool roughly tripled
+  // in one push (19 -> 50+ artists), which roughly tripled the total number
+  // of release/feature calls made at this same pacing — confirmed via a
+  // real run hitting 429 on both calls at 400ms once volume grew this much.
   const SPOTIFY_BATCH_SIZE = 2;
-  const SPOTIFY_BATCH_DELAY_MS = 400;
+  const SPOTIFY_BATCH_DELAY_MS = 700;
   const spotifyCache = new Map();
   if (spotifyToken) {
     const spotifyArtists = artists.filter((a) => a.spotify_id);
-    try {
-      const batchData = await getSpotifyArtistsBatch(
-        spotifyToken,
-        spotifyArtists.map((a) => a.spotify_id)
-      );
-      for (const artist of spotifyArtists) {
-        spotifyCache.set(artist.id, { data: batchData.get(artist.spotify_id) || null });
-      }
-    } catch (e) {
-      logSpotifyErrorOnce(e);
+    const { data: batchData, errors: batchErrors } = await getSpotifyArtistsBatch(
+      spotifyToken,
+      spotifyArtists.map((a) => a.spotify_id)
+    );
+    for (const e of batchErrors) logSpotifyErrorOnce(e);
+    for (const artist of spotifyArtists) {
+      spotifyCache.set(artist.id, { data: batchData.get(artist.spotify_id) || null });
     }
     await processInBatches(spotifyArtists, SPOTIFY_BATCH_SIZE, async (artist) => {
       const entry = spotifyCache.get(artist.id) || {};
