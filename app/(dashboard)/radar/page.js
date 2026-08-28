@@ -1,6 +1,7 @@
 import { createClient } from "@/lib/supabase/server";
 import ArtistFace from "@/components/ArtistFace";
 import LiveRefresh from "@/components/LiveRefresh";
+import LiveValueMovers from "@/components/LiveValueMovers";
 
 export default async function RadarPage() {
   const supabase = await createClient();
@@ -99,34 +100,7 @@ export default async function RadarPage() {
           <div className="text-[13px] uppercase tracking-wide text-[var(--text-faint)] font-bold mb-3">
             Pourquoi les valeurs bougent
           </div>
-          {valueMovers.map((a) => {
-            const up = a.value > (a.cost || a.value);
-            return (
-              <div
-                key={a.id}
-                className="flex items-center gap-3 bg-[var(--surface)] border border-[var(--border)] rounded-2xl px-3.5 py-3 mb-2.5"
-              >
-                <ArtistFace
-                  imageUrl={a.image_url}
-                  initials={a.initials}
-                  color={a.color}
-                  name={a.name}
-                  size={40}
-                />
-                <div className="flex-1">
-                  <div className="text-xs font-bold mb-0.5">{a.name}</div>
-                  <div className="text-[13px] text-[var(--text-muted)]">{a.value_reason}</div>
-                </div>
-                <div
-                  className={`mono text-xs font-bold whitespace-nowrap ${
-                    up ? "text-[var(--gold)]" : "text-[var(--crimson)]"
-                  }`}
-                >
-                  {up ? "▲" : "▼"} {a.value}M
-                </div>
-              </div>
-            );
-          })}
+          <LiveValueMovers movers={valueMovers} />
         </>
       )}
 

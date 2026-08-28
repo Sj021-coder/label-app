@@ -40,6 +40,14 @@ export default function SyncHealthCard({ runs }) {
         {last.errors?.length > 0 ? ` · ${last.errors.length} souci(s)` : " · aucun souci"}
       </div>
 
+      {last.results?.releaseChecks && (
+        <div className="text-[11px] text-[var(--text-faint)] mb-4">
+          🔄 Vérif. des sorties : groupe {last.results.releaseChecks.group}/
+          {last.results.releaseChecks.totalGroups} · {last.results.releaseChecks.checkedThisRun} artiste(s)
+          vérifié(s) ce cycle (par rotation, pour ne jamais surcharger Spotify)
+        </div>
+      )}
+
       {last.errors?.length > 0 && (
         <div className="mb-4 bg-[var(--crimson)]/10 border border-[var(--crimson)]/30 rounded-xl p-3">
           <div className="text-[11px] uppercase tracking-wide text-[var(--crimson)] font-bold mb-1.5">

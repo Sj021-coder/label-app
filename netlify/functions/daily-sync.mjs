@@ -528,7 +528,32 @@ export default async () => {
     for (const artist of spotifyArtists) {
       spotifyCache.set(artist.id, { data: batchData.get(artist.spotify_id) || null });
     }
-    await processInBatches(spotifyArtists, SPOTIFY_BATCH_SIZE, async (artist) => {
+
+    // Real scaling fix, not just a bigger pause: popularity/followers above
+    // covers EVERY mapped artist every run (cheap — one bulk call). But
+    // release/feature has no bulk endpoint at all, so checking everyone
+    // every run means the call volume grows in lockstep with the pool —
+    // fine at 50 artists, guaranteed to blow the ~60s run ceiling (and
+    // Spotify's rate limit) at 1000. So this checks a bounded SLICE each
+    // run and rotates which slice, based on time — not a stored counter,
+    // so no new DB state needed. At 100 artists that's full coverage every
+    // ~1.5 runs (same-day freshness); at 1000 it's roughly every 12 days
+    // per artist instead of every run — slower detection at real scale,
+    // but the run itself never breaks, which matters more.
+    const RELEASE_CHECK_BATCH_LIMIT = 40;
+    const totalGroups = Math.max(1, Math.ceil(spotifyArtists.length / RELEASE_CHECK_BATCH_LIMIT));
+    const runIndex = Math.floor(now.getTime() / (12 * 60 * 60 * 1000)); // ticks once per scheduled run (8h/20h UTC)
+    const group = runIndex % totalGroups;
+    const releaseCheckArtists = spotifyArtists.slice(
+      group * RELEASE_CHECK_BATCH_LIMIT,
+      (group + 1) * RELEASE_CHECK_BATCH_LIMIT
+    );
+
+    // Visible in sync_runs/the Admin health card — so "is the rotation
+    // actually rotating" is checkable at a glance, not just trusted blind.
+    results.releaseChecks = { checkedThisRun: releaseCheckArtists.length, group: group + 1, totalGroups };
+
+    await processInBatches(releaseCheckArtists, SPOTIFY_BATCH_SIZE, async (artist) => {
       const entry = spotifyCache.get(artist.id) || {};
       try {
         entry.release = await getLatestRelease(spotifyToken, artist.spotify_id);
