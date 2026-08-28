@@ -1,0 +1,13 @@
+{
+  "name": "LABEL",
+  "short_name": "LABEL",
+  "description": "Fantasy rap français — construis ton label, suis tes artistes en direct.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#161018",
+  "theme_color": "#161018",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

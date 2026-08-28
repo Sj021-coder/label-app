@@ -3,6 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import NavTabs from "@/components/NavTabs";
 import WeeklyBanner from "@/components/WeeklyBanner";
 import SignOutButton from "@/components/SignOutButton";
+import NotificationPrompt from "@/components/NotificationPrompt";
 import { getBilanWindow } from "@/lib/weeklyProgram";
 
 export default async function DashboardLayout({ children }) {
@@ -46,6 +47,7 @@ export default async function DashboardLayout({ children }) {
         </div>
       )}
       <WeeklyBanner bilanReady={bilanReady} />
+      <NotificationPrompt />
       <NavTabs isAdmin={!!profile.is_admin} />
       <div className="px-4 pb-10">{children}</div>
     </div>

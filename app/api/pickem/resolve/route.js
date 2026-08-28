@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getAdminContext } from "@/lib/supabase/admin";
 import { PICKEM_STAKE } from "@/lib/gameRules";
+import { sendPushToUser } from "@/lib/push/send";
 
 export async function POST(request) {
   const { supabase, user, isAdmin } = await getAdminContext();
@@ -11,7 +12,7 @@ export async function POST(request) {
 
   const { data: prediction, error: predErr } = await supabase
     .from("predictions")
-    .select("coefficient")
+    .select("coefficient, question")
     .eq("id", predictionId)
     .single();
   if (predErr || !prediction) {
@@ -54,6 +55,16 @@ export async function POST(request) {
       .eq("id", pick.user_id);
     if (won) winners++;
     else losers++;
+
+    // Fire-and-forget: a slow/failed push must never block resolving the
+    // prediction or updating anyone else's score. sendPushToUser already
+    // swallows per-device errors internally, so this only fails if the
+    // whole push subsystem is down, and even then it must stay silent here.
+    sendPushToUser(pick.user_id, {
+      title: won ? "✅ Bien vu !" : "❌ Raté cette fois",
+      body: `« ${prediction.question} » — ${won ? `+${winDelta}` : `-${loseDelta}`} pts`,
+      url: "/pickem",
+    }).catch(() => {});
   }
 
   return NextResponse.json({ success: true, winners, losers, winDelta, loseDelta, stake: PICKEM_STAKE });

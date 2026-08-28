@@ -5,6 +5,7 @@ import AdminPickem from "./AdminPickem";
 import AdminMapping from "./AdminMapping";
 import MetricsPanel from "./MetricsPanel";
 import SyncHealthCard from "./SyncHealthCard";
+import AdminPushTest from "./AdminPushTest";
 
 export default async function AdminPage() {
   // 🔒 Admin gate: only a profile with is_admin = true may see this page.
@@ -124,6 +125,7 @@ export default async function AdminPage() {
         Santé du moteur
       </div>
       <SyncHealthCard runs={syncRuns || []} />
+      <AdminPushTest />
 
       <div className="mt-10 pt-6 border-t border-[var(--border)]">
         <div className="text-[13px] uppercase tracking-wide text-[var(--text-faint)] font-bold mb-3">
