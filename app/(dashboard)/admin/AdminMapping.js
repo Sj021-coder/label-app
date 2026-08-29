@@ -111,6 +111,17 @@ export default function AdminMapping({ artists, newsItems }) {
     router.refresh();
   }
 
+  // Removes a mapping entirely — for when no confident match exists (e.g.
+  // Aden, Djame from the audit) and leaving it unmapped is honestly better
+  // than guessing wrong. Same endpoint, just null instead of an ID.
+  async function clearSpotify() {
+    setMapConfirmation(null);
+    await assignSpotify(null);
+  }
+  async function clearYoutube() {
+    await assignYoutube(null);
+  }
+
   async function markReviewed(newsId) {
     await fetch("/api/admin/mark-news-reviewed", {
       method: "POST",
@@ -166,6 +177,31 @@ export default function AdminMapping({ artists, newsItems }) {
           </option>
         ))}
       </select>
+
+      {/* Current mapping status + a way to actually remove one — didn't
+          exist before. Needed for cases like Aden/Djame from the audit,
+          where no confident match exists and unmapped is honestly better
+          than a guessed wrong one. */}
+      {selected && (selected.spotify_id || selected.youtube_channel_id) && (
+        <div className="flex flex-wrap gap-1.5 mb-3">
+          {selected.spotify_id && (
+            <button
+              onClick={clearSpotify}
+              className="text-[11px] font-bold px-3 py-1.5 rounded-full bg-[var(--surface-2)] text-[var(--text-faint)]"
+            >
+              🎵 Mappé · ✕ Retirer
+            </button>
+          )}
+          {selected.youtube_channel_id && (
+            <button
+              onClick={clearYoutube}
+              className="text-[11px] font-bold px-3 py-1.5 rounded-full bg-[var(--surface-2)] text-[var(--text-faint)]"
+            >
+              ▶️ Mappé · ✕ Retirer
+            </button>
+          )}
+        </div>
+      )}
 
       {error && <p className="text-[var(--crimson)] text-xs mb-2">{error}</p>}
 
