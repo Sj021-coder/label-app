@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getAdminContext } from "@/lib/supabase/admin";
-import { getSpotifyArtistImage } from "@/lib/integrations/spotify";
+import { getSpotifyArtistDetails } from "@/lib/integrations/spotify";
 
 export async function POST(request) {
   const { supabase, user, isAdmin } = await getAdminContext();
@@ -10,12 +10,19 @@ export async function POST(request) {
   const { artistId, spotifyId, youtubeChannelId } = await request.json();
 
   const update = {};
+  let mappedTo = null;
   if (spotifyId !== undefined) {
     update.spotify_id = spotifyId;
-    // Auto-grab the artist's photo from Spotify at mapping time (best-effort).
+    // Fetch name + photo + genres in one call (best-effort — save still
+    // succeeds even if this fails). The name comes back to the UI so a
+    // wrong mapping is visible the instant it's made, e.g. "✓ Mappé à :
+    // black midi" is an immediate red flag when you meant to save "Black M".
     if (spotifyId) {
-      const img = await getSpotifyArtistImage(spotifyId);
-      if (img) update.image_url = img;
+      const details = await getSpotifyArtistDetails(spotifyId);
+      if (details) {
+        if (details.image) update.image_url = details.image;
+        mappedTo = { name: details.name, genres: details.genres };
+      }
     }
   }
   if (youtubeChannelId !== undefined) update.youtube_channel_id = youtubeChannelId;
@@ -23,5 +30,5 @@ export async function POST(request) {
   const { error } = await supabase.from("artists").update(update).eq("id", artistId);
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
-  return NextResponse.json({ success: true });
+  return NextResponse.json({ success: true, mappedTo });
 }

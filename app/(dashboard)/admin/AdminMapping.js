@@ -32,6 +32,7 @@ export default function AdminMapping({ artists, newsItems }) {
   const [filter, setFilter] = useState("");
   const [manualSpotifyId, setManualSpotifyId] = useState("");
   const [manualYoutubeId, setManualYoutubeId] = useState("");
+  const [mapConfirmation, setMapConfirmation] = useState(null); // { name, genres, mismatch }
   const router = useRouter();
 
   const selected = artists.find((a) => a.id === selectedId);
@@ -80,13 +81,23 @@ export default function AdminMapping({ artists, newsItems }) {
   }
 
   async function assignSpotify(spotifyId) {
-    await fetch("/api/admin/save-artist-ids", {
+    const res = await fetch("/api/admin/save-artist-ids", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ artistId: selectedId, spotifyId }),
     });
+    const data = await res.json().catch(() => ({}));
     setSpotifyResults([]);
     setManualSpotifyId("");
+    // Rough heuristic, not the real safeguard — the real safeguard is the
+    // admin reading the name/genres themselves. This just highlights the
+    // obvious cases (completely unrelated first word) in red automatically.
+    if (data.mappedTo && selected) {
+      const ours = selected.name.toLowerCase().split(" ")[0];
+      const theirs = (data.mappedTo.name || "").toLowerCase();
+      const mismatch = ours.length > 1 && !theirs.includes(ours);
+      setMapConfirmation({ ...data.mappedTo, mismatch });
+    }
     router.refresh();
   }
 
@@ -146,6 +157,7 @@ export default function AdminMapping({ artists, newsItems }) {
           setYoutubeResults([]);
           setManualSpotifyId("");
           setManualYoutubeId("");
+          setMapConfirmation(null);
         }}
         className="w-full bg-[var(--surface)] border border-[var(--border)] rounded-xl px-3 py-2.5 text-sm mb-3"
       >
@@ -217,21 +229,56 @@ export default function AdminMapping({ artists, newsItems }) {
         </div>
       </div>
 
+      {/* Confirms exactly what got saved — visible the instant a mapping
+          is made, not days later when a wrong artist's data shows up on
+          Radar (which is exactly how the Blacko/Black M mismatches went
+          unnoticed originally). */}
+      {mapConfirmation && (
+        <div
+          className={`rounded-xl px-3 py-2.5 mb-3 text-xs border ${
+            mapConfirmation.mismatch
+              ? "bg-[var(--crimson)]/10 border-[var(--crimson)]/40"
+              : "bg-[var(--gold-soft)] border-[var(--gold)]/40"
+          }`}
+        >
+          <div className={`font-bold ${mapConfirmation.mismatch ? "text-[var(--crimson)]" : "text-[var(--gold)]"}`}>
+            {mapConfirmation.mismatch ? "⚠️ Vérifie bien —" : "✓"} Mappé à : {mapConfirmation.name}
+          </div>
+          {mapConfirmation.genres?.length > 0 && (
+            <div className="text-[var(--text-faint)] mt-0.5">{mapConfirmation.genres.slice(0, 4).join(", ")}</div>
+          )}
+        </div>
+      )}
+
       {spotifyResults.length > 0 && (
         <div className="mb-3">
           <div className="text-[11px] text-[var(--text-faint)] uppercase font-bold mb-1.5">
             Résultats Spotify
           </div>
+          {/* Photo + genres shown here on purpose — name and follower count
+              alone once let "Black M" get saved as a UK rock band and
+              "Kikesa" as a Canadian house singer. A glance at the face and
+              "rock, experimental" vs "french hip hop" catches that a
+              plain popularity number never will. */}
           {spotifyResults.map((r) => (
             <button
               key={r.id}
               onClick={() => assignSpotify(r.id)}
-              className="w-full text-left bg-[var(--surface)] border border-[var(--border)] rounded-lg px-3 py-2 mb-1.5 text-xs"
+              className="w-full text-left bg-[var(--surface)] border border-[var(--border)] rounded-lg px-3 py-2 mb-1.5 text-xs flex items-center gap-2.5"
             >
-              <span className="font-bold">{r.name}</span>{" "}
-              <span className="text-[var(--text-faint)]">
-                pop. {r.popularity} · {r.followers?.toLocaleString()} followers
-              </span>
+              {r.image ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={r.image} alt={r.name} className="w-9 h-9 rounded-full object-cover flex-shrink-0" />
+              ) : (
+                <div className="w-9 h-9 rounded-full bg-[var(--surface-2)] flex-shrink-0" />
+              )}
+              <div className="flex-1 min-w-0">
+                <div className="font-bold">{r.name}</div>
+                <div className="text-[var(--text-faint)] truncate">
+                  {r.genres?.length > 0 ? r.genres.slice(0, 3).join(", ") : "genre non précisé"} ·{" "}
+                  {r.followers?.toLocaleString()} followers
+                </div>
+              </div>
             </button>
           ))}
         </div>

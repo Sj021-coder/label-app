@@ -90,29 +90,54 @@ async function getSpotifyArtistsBatch(token, spotifyIds) {
   return { data, errors };
 }
 
+// Picks the item with the true maximum release_date out of a page of
+// results — release_date strings are ISO-prefixed (YYYY, YYYY-MM, or
+// YYYY-MM-DD), so plain string comparison sorts them correctly even when
+// items mix precisions.
+function pickNewestByDate(items) {
+  if (!items || items.length === 0) return null;
+  return items.reduce((max, item) => (!max || item.release_date > max.release_date ? item : max), null);
+}
+
 async function getLatestRelease(token, spotifyId) {
-  const url = `https://api.spotify.com/v1/artists/${spotifyId}/albums?include_groups=album,single&limit=1&market=FR`;
+  // limit=50, not 1 — real bug fixed here: Spotify's /albums endpoint has
+  // NO documented sort order, so the old code's `items[0]` could just as
+  // easily be the artist's OLDEST album as their newest (confirmed in
+  // production: several artists were frozen on years-old releases while
+  // real new ones existed). Fetching a real page and picking the true max
+  // date costs nothing extra — still exactly 1 HTTP request, just a
+  // bigger response body.
+  const url = `https://api.spotify.com/v1/artists/${spotifyId}/albums?include_groups=album,single&limit=50&market=FR`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) throw new Error(`Spotify releases fetch failed: ${res.status} ${res.statusText}`);
   const data = await res.json();
-  const latest = data.items?.[0];
+  const latest = pickNewestByDate(data.items);
   if (!latest) return null;
   return {
     name: latest.name,
     releaseDate: latest.release_date,
+    releaseDatePrecision: latest.release_date_precision,
     type: latest.album_type,
   };
 }
 
 async function getLatestFeature(token, spotifyId) {
-  // "appears_on" = tracks by OTHER artists that this artist is featured on
-  const url = `https://api.spotify.com/v1/artists/${spotifyId}/albums?include_groups=appears_on&limit=1&market=FR`;
+  // "appears_on" = tracks by OTHER artists that this artist is featured on.
+  // Same limit=50 + true-max-date fix as getLatestRelease above — same
+  // underlying bug: `items[0]` here was never guaranteed to be the most
+  // recent feature, just whatever order Spotify happened to return.
+  const url = `https://api.spotify.com/v1/artists/${spotifyId}/albums?include_groups=appears_on&limit=50&market=FR`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) throw new Error(`Spotify features fetch failed: ${res.status} ${res.statusText}`);
   const data = await res.json();
-  const latest = data.items?.[0];
+  const latest = pickNewestByDate(data.items);
   if (!latest) return null;
-  return { name: latest.name, releaseDate: latest.release_date, byArtist: latest.artists?.[0]?.name };
+  return {
+    name: latest.name,
+    releaseDate: latest.release_date,
+    releaseDatePrecision: latest.release_date_precision,
+    byArtist: latest.artists?.[0]?.name,
+  };
 }
 
 // YouTube's channels.list also accepts multiple IDs in one call — same fix
@@ -274,6 +299,13 @@ const RULES = {
   VALUE_MAX_MULTIPLIER: 3.0, // value can't rise above 300% of base cost
 };
 
+// A "new" release/feature has to actually be recent, not just newer than
+// our stale baseline — a real bug once let a mis-mapped artist's YEARS-old
+// back catalogue get announced as "just dropped" because it merely sorted
+// higher than what we had stored. See daily-sync's release/feature
+// detection blocks below.
+const RELEASE_RECENCY_DAYS = 30;
+
 // Explainability: turn "value went from 24M to 27M" into a real reason,
 // never a black box. Picks whichever category moved the most this run and
 // describes it in plain language — same categories the score is built from.
@@ -404,7 +436,7 @@ export default async () => {
     const { data: artists, error } = await supabase
       .from("artists")
       .select(
-        "id, name, cost, value, spotify_id, youtube_channel_id, deezer_id, image_url, momentum_score, performance_score, activity_score, culture_score, last_spotify_popularity, last_spotify_followers, last_youtube_view_count, last_youtube_subscribers, last_release_date, last_release_name, last_feature_date, last_deezer_fans, last_deezer_rank"
+        "id, name, cost, value, spotify_id, youtube_channel_id, deezer_id, image_url, momentum_score, performance_score, activity_score, culture_score, last_spotify_popularity, last_spotify_followers, last_youtube_view_count, last_youtube_subscribers, last_release_date, last_release_name, last_feature_date, last_feature_name, last_deezer_fans, last_deezer_rank"
       );
 
     if (error) {
@@ -779,32 +811,51 @@ export default async () => {
       if (spotifyToken && artist.spotify_id) {
         const release = spotifyCache.get(artist.id)?.release || null;
         if (release && release.releaseDate) {
-          const isNewRelease =
-            artist.last_release_date && release.releaseDate > artist.last_release_date;
+          const isNewerDate = artist.last_release_date && release.releaseDate > artist.last_release_date;
           const isFirstSync = !artist.last_release_date;
+          const nameChanged = release.name !== artist.last_release_name;
+          const daysSinceRelease = (now - new Date(release.releaseDate)) / 86400000;
 
-          if (isNewRelease) {
-            const delta = release.type === "album" ? 30 : 10; // album vs single/feature
+          // A date sorting higher than our baseline is NOT enough on its
+          // own to call something "new" — that's exactly the bug that let
+          // a mis-mapped artist's years-old back catalogue get announced
+          // as a fresh drop (it merely sorted higher than our stale
+          // baseline). Real news also has to be genuinely recent AND a
+          // different release by name, so a reissue/remaster with a
+          // bumped date can't re-fire the same event.
+          const isRealNewRelease = isNewerDate && nameChanged && daysSinceRelease <= RELEASE_RECENCY_DAYS;
+
+          if (isRealNewRelease) {
+            const delta = release.type === "album" ? 30 : 10; // album vs single
             await applyScoreEvent(
               supabase,
               artist,
               "activity",
               delta,
               release.type === "album"
-                ? `💿 New album dropped: "${release.name}"`
-                : `🎵 New single dropped: "${release.name}"`,
-              release.type === "album" ? "label_deal" : "feature",
+                ? `💿 Nouvel album : « ${release.name} »`
+                : `🎵 Nouveau single : « ${release.name} »`,
+              release.type === "album" ? "new_album" : "new_single",
               poolAverage,
               seasonId
             );
             results.releasesDetected = (results.releasesDetected || 0) + 1;
           }
 
-          if (isNewRelease || isFirstSync) {
+          // Baseline advances whenever the date moved forward at all, even
+          // when it wasn't recent enough to score — otherwise the same
+          // stale gap would keep re-evaluating (and re-failing the
+          // recency check) forever. Written back onto the in-memory
+          // `artist` object too (missing before) so a second event later
+          // in this same run sees the fresh baseline, not the one loaded
+          // at the top of the run.
+          if (isNewerDate || isFirstSync) {
             await supabase
               .from("artists")
               .update({ last_release_date: release.releaseDate, last_release_name: release.name })
               .eq("id", artist.id);
+            artist.last_release_date = release.releaseDate;
+            artist.last_release_name = release.name;
           }
         }
       }
@@ -813,29 +864,33 @@ export default async () => {
       if (spotifyToken && artist.spotify_id) {
         const feature = spotifyCache.get(artist.id)?.feature || null;
         if (feature && feature.releaseDate) {
-          const isNewFeature =
-            artist.last_feature_date && feature.releaseDate > artist.last_feature_date;
+          const isNewerDate = artist.last_feature_date && feature.releaseDate > artist.last_feature_date;
           const isFirstFeatureSync = !artist.last_feature_date;
+          const nameChanged = feature.name !== artist.last_feature_name;
+          const daysSinceFeature = (now - new Date(feature.releaseDate)) / 86400000;
+          const isRealNewFeature = isNewerDate && nameChanged && daysSinceFeature <= RELEASE_RECENCY_DAYS;
 
-          if (isNewFeature) {
+          if (isRealNewFeature) {
             await applyScoreEvent(
               supabase,
               artist,
               "activity",
               10,
-              `🤝 New feature: "${feature.name}"${feature.byArtist ? ` with ${feature.byArtist}` : ""}`,
-              "feature",
+              `🤝 Featuring : « ${feature.name} »${feature.byArtist ? ` avec ${feature.byArtist}` : ""}`,
+              "new_feature",
               poolAverage,
               seasonId
             );
             results.featuresDetected = (results.featuresDetected || 0) + 1;
           }
 
-          if (isNewFeature || isFirstFeatureSync) {
+          if (isNewerDate || isFirstFeatureSync) {
             await supabase
               .from("artists")
-              .update({ last_feature_date: feature.releaseDate })
+              .update({ last_feature_date: feature.releaseDate, last_feature_name: feature.name })
               .eq("id", artist.id);
+            artist.last_feature_date = feature.releaseDate;
+            artist.last_feature_name = feature.name;
           }
         }
       }
