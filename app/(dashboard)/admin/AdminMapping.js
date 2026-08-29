@@ -32,7 +32,7 @@ export default function AdminMapping({ artists, newsItems }) {
   const [filter, setFilter] = useState("");
   const [manualSpotifyId, setManualSpotifyId] = useState("");
   const [manualYoutubeId, setManualYoutubeId] = useState("");
-  const [mapConfirmation, setMapConfirmation] = useState(null); // { name, genres, mismatch }
+  const [mapConfirmation, setMapConfirmation] = useState(null); // { name, genres }
   const router = useRouter();
 
   const selected = artists.find((a) => a.id === selectedId);
@@ -89,15 +89,14 @@ export default function AdminMapping({ artists, newsItems }) {
     const data = await res.json().catch(() => ({}));
     setSpotifyResults([]);
     setManualSpotifyId("");
-    // Rough heuristic, not the real safeguard — the real safeguard is the
-    // admin reading the name/genres themselves. This just highlights the
-    // obvious cases (completely unrelated first word) in red automatically.
-    if (data.mappedTo && selected) {
-      const ours = selected.name.toLowerCase().split(" ")[0];
-      const theirs = (data.mappedTo.name || "").toLowerCase();
-      const mismatch = ours.length > 1 && !theirs.includes(ours);
-      setMapConfirmation({ ...data.mappedTo, mismatch });
-    }
+    // No automated "is this a mismatch" judgment here on purpose — a first
+    // attempt at one turned out unreliable both ways: it would have missed
+    // the real Black M / black midi mix-up (both names share the word
+    // "black"), and separately flagged a genuinely correct match ("Blacko"
+    // vs Spotify's own "Blacko (Sniper)") as suspicious. Rather than cry
+    // wolf or give false confidence, this just shows exactly what got
+    // saved — reading it is the real safeguard, not a keyword guess.
+    if (data.mappedTo) setMapConfirmation(data.mappedTo);
     router.refresh();
   }
 
@@ -232,18 +231,11 @@ export default function AdminMapping({ artists, newsItems }) {
       {/* Confirms exactly what got saved — visible the instant a mapping
           is made, not days later when a wrong artist's data shows up on
           Radar (which is exactly how the Blacko/Black M mismatches went
-          unnoticed originally). */}
+          unnoticed originally). Deliberately neutral, no automated
+          right/wrong judgment — read it yourself, that's the real check. */}
       {mapConfirmation && (
-        <div
-          className={`rounded-xl px-3 py-2.5 mb-3 text-xs border ${
-            mapConfirmation.mismatch
-              ? "bg-[var(--crimson)]/10 border-[var(--crimson)]/40"
-              : "bg-[var(--gold-soft)] border-[var(--gold)]/40"
-          }`}
-        >
-          <div className={`font-bold ${mapConfirmation.mismatch ? "text-[var(--crimson)]" : "text-[var(--gold)]"}`}>
-            {mapConfirmation.mismatch ? "⚠️ Vérifie bien —" : "✓"} Mappé à : {mapConfirmation.name}
-          </div>
+        <div className="rounded-xl px-3 py-2.5 mb-3 text-xs border bg-[var(--surface-2)] border-[var(--border)]">
+          <div className="font-bold text-[var(--text)]">Mappé à : {mapConfirmation.name}</div>
           {mapConfirmation.genres?.length > 0 && (
             <div className="text-[var(--text-faint)] mt-0.5">{mapConfirmation.genres.slice(0, 4).join(", ")}</div>
           )}
