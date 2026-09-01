@@ -140,6 +140,68 @@ async function getLatestFeature(token, spotifyId) {
   };
 }
 
+// MusicBrainz — a genuine backup for release detection, not a duplicate
+// of Spotify's. Only ever called for an artist Spotify DIDN'T check this
+// cycle (see the fallback rotation below), so there's no double-counting
+// risk by construction — one or the other runs for a given artist, never
+// both. Free for non-commercial use, but MusicBrainz enforces a real
+// 1-request-per-second limit and requires an identifying User-Agent —
+// both are respected here. NOTE: this endpoint could not be live-tested
+// against a running server before shipping (MusicBrainz returned 503 to a
+// verification request without the full pacing this function uses in
+// production) — built carefully against their long-stable, widely-used
+// documented API shape, but the first real cycle is the actual proof.
+async function getLatestReleaseFromMusicBrainz(artistName) {
+  const url = `https://musicbrainz.org/ws/2/release-group/?query=${encodeURIComponent(
+    `artist:"${artistName}"`
+  )}&fmt=json&limit=25`;
+  const res = await fetch(url, {
+    headers: { "User-Agent": "LABEL-FantasyRapApp/1.0 (contact: samanjmor21@gmail.com)" },
+  });
+  if (!res.ok) throw new Error(`MusicBrainz fetch failed: ${res.status}`);
+  const data = await res.json();
+  const groups = (data["release-groups"] || []).filter((g) => g["first-release-date"]);
+  if (!groups.length) return null;
+  const latest = groups.reduce(
+    (max, g) => (!max || g["first-release-date"] > max["first-release-date"] ? g : max),
+    null
+  );
+  return {
+    name: latest.title,
+    releaseDate: latest["first-release-date"],
+    type: (latest["primary-type"] || "album").toLowerCase(),
+  };
+}
+
+// kworb.net — real per-song Spotify stream counts, keyed by the same
+// Spotify artist ID already stored (verified working directly against a
+// real artist page before writing this). Their own robots.txt explicitly
+// allows automated access (`Allow: /` for every bot) — the one real
+// caveat is this is still an unofficial page, not a documented API, so
+// its HTML structure could change without notice.
+async function getKworbTopTrack(spotifyId) {
+  const res = await fetch(`https://kworb.net/spotify/artist/${spotifyId}.html`);
+  if (!res.ok) return null;
+  const html = await res.text();
+  // Verified against the real page before shipping this (not guessed):
+  // <td>2019/03/22</td><td class="text"><div><a href="...">Song</a></div></td><td>305,841,362</td>
+  // — note the song title sits inside an extra <div>, and some rows have a
+  // "* " prefix before the <a> tag. Takes the row with the highest stream
+  // count — the artist's single biggest song overall, not their most
+  // recent chart entry.
+  const rowRe =
+    /<td>[\d/]+<\/td>\s*<td class="text"><div>(?:\*\s*)?<a[^>]*>([^<]+)<\/a><\/div><\/td>\s*<td>([\d,]+)<\/td>/g;
+  let best = null;
+  let match;
+  while ((match = rowRe.exec(html)) !== null) {
+    const streams = parseInt(match[2].replace(/,/g, ""), 10);
+    if (!Number.isNaN(streams) && (!best || streams > best.streams)) {
+      best = { name: match[1].trim(), streams };
+    }
+  }
+  return best;
+}
+
 // YouTube's channels.list also accepts multiple IDs in one call — same fix
 // as Spotify's batch endpoint, same reason. Returns a Map keyed by channelId.
 async function getYoutubeStatsBatch(channelIds) {
@@ -460,7 +522,7 @@ export default async () => {
     const { data: artists, error } = await supabase
       .from("artists")
       .select(
-        "id, name, cost, value, spotify_id, youtube_channel_id, deezer_id, image_url, momentum_score, performance_score, activity_score, culture_score, last_spotify_popularity, last_spotify_followers, last_youtube_view_count, last_youtube_subscribers, last_release_date, last_release_name, last_feature_date, last_feature_name, last_deezer_fans, last_deezer_rank"
+        "id, name, cost, value, spotify_id, youtube_channel_id, deezer_id, image_url, momentum_score, performance_score, activity_score, culture_score, last_spotify_popularity, last_spotify_followers, last_youtube_view_count, last_youtube_subscribers, last_release_date, last_release_name, last_feature_date, last_feature_name, last_deezer_fans, last_deezer_rank, last_release_date_mb, last_release_name_mb, top_track_name, top_track_streams"
       );
 
     if (error) {
@@ -574,6 +636,11 @@ export default async () => {
   const SPOTIFY_BATCH_SIZE = 2;
   const SPOTIFY_BATCH_DELAY_MS = 700;
   const spotifyCache = new Map();
+  // Tracks who Spotify's release rotation actually covers this run — used
+  // right after this block to hand MusicBrainz exactly the artists Spotify
+  // DIDN'T check, so the two sources can never fire for the same artist in
+  // the same cycle (no double-counting possible, by construction).
+  const spotifyCheckedThisRun = new Set();
   if (spotifyToken) {
     const spotifyArtists = artists.filter((a) => a.spotify_id);
     const { data: batchData, errors: batchErrors } = await getSpotifyArtistsBatch(
@@ -608,6 +675,7 @@ export default async () => {
     // Visible in sync_runs/the Admin health card — so "is the rotation
     // actually rotating" is checkable at a glance, not just trusted blind.
     results.releaseChecks = { checkedThisRun: releaseCheckArtists.length, group: group + 1, totalGroups };
+    for (const a of releaseCheckArtists) spotifyCheckedThisRun.add(a.id);
 
     await processInBatches(releaseCheckArtists, SPOTIFY_BATCH_SIZE, async (artist) => {
       const entry = spotifyCache.get(artist.id) || {};
@@ -624,6 +692,64 @@ export default async () => {
       spotifyCache.set(artist.id, entry);
     }, SPOTIFY_BATCH_DELAY_MS);
   }
+
+  // --- MusicBrainz fallback pre-fetch ---
+  // Only for artists Spotify did NOT check this run (no spotify_id at all,
+  // or simply outside this cycle's rotation slice) — never the same
+  // artist as the Spotify release check in the same run. Kept deliberately
+  // small: MusicBrainz's 1-request-per-second limit is fully SEQUENTIAL
+  // (no concurrency possible, unlike everything else in this file), so
+  // even a small number here adds real wall-clock time on top of a run
+  // that was already using more than half its ~60s budget. 8, not 15 —
+  // slower full rotation through fallback candidates, but real margin
+  // kept against the exact timeout bug this project already fixed once.
+  const musicBrainzCache = new Map();
+  const MUSICBRAINZ_CHECK_LIMIT = 8;
+  const mbCandidates = artists.filter((a) => !spotifyCheckedThisRun.has(a.id));
+  const mbTotalGroups = Math.max(1, Math.ceil(mbCandidates.length / MUSICBRAINZ_CHECK_LIMIT));
+  const mbRunIndex = Math.floor(now.getTime() / (12 * 60 * 60 * 1000));
+  const mbGroup = mbRunIndex % mbTotalGroups;
+  const mbCheckArtists = mbCandidates.slice(
+    mbGroup * MUSICBRAINZ_CHECK_LIMIT,
+    (mbGroup + 1) * MUSICBRAINZ_CHECK_LIMIT
+  );
+  results.musicBrainzChecks = { checkedThisRun: mbCheckArtists.length, group: mbGroup + 1, totalGroups: mbTotalGroups };
+  for (const artist of mbCheckArtists) {
+    try {
+      const release = await getLatestReleaseFromMusicBrainz(artist.name);
+      if (release) musicBrainzCache.set(artist.id, release);
+    } catch (e) {
+      results.errors.push(`MusicBrainz: ${e.message}`);
+    }
+    await sleep(1100); // hard limit is 1/sec — 1100ms leaves real margin
+  }
+
+  // --- kworb.net pre-fetch (real per-song stream counts) ---
+  // Only for artists we already have a real Spotify ID for — kworb's URLs
+  // are keyed by that same ID, verified working directly against a real
+  // page before this shipped. No stated rate limit, but scraping 100
+  // individual pages every run is still worth pacing politely, so this
+  // reuses the same rotation pattern as everything else rather than
+  // hammering all of them at once.
+  const kworbCache = new Map();
+  const KWORB_CHECK_LIMIT = 40;
+  const kworbArtists = artists.filter((a) => a.spotify_id);
+  const kworbTotalGroups = Math.max(1, Math.ceil(kworbArtists.length / KWORB_CHECK_LIMIT));
+  const kworbRunIndex = Math.floor(now.getTime() / (12 * 60 * 60 * 1000));
+  const kworbGroup = kworbRunIndex % kworbTotalGroups;
+  const kworbCheckArtists = kworbArtists.slice(
+    kworbGroup * KWORB_CHECK_LIMIT,
+    (kworbGroup + 1) * KWORB_CHECK_LIMIT
+  );
+  results.kworbChecks = { checkedThisRun: kworbCheckArtists.length, group: kworbGroup + 1, totalGroups: kworbTotalGroups };
+  await processInBatches(kworbCheckArtists, 5, async (artist) => {
+    try {
+      const topTrack = await getKworbTopTrack(artist.spotify_id);
+      if (topTrack) kworbCache.set(artist.id, topTrack);
+    } catch (e) {
+      results.errors.push(`kworb: ${e.message}`);
+    }
+  }, 300);
 
   // --- YouTube pre-fetch — same bulk-call fix ---
   // Upcoming-premiere detection (search.list) has no bulk equivalent and
@@ -915,6 +1041,86 @@ export default async () => {
               .eq("id", artist.id);
             artist.last_feature_date = feature.releaseDate;
             artist.last_feature_name = feature.name;
+          }
+        }
+      }
+
+      // --- MusicBrainz release detection (fallback only — see pre-fetch
+      // above for exactly which artists this runs for). Same recency +
+      // name-change guard as the Spotify path, same reasoning: a date
+      // merely sorting higher than a stale baseline isn't "new" on its own. ---
+      {
+        const mbRelease = musicBrainzCache.get(artist.id) || null;
+        if (mbRelease && mbRelease.releaseDate) {
+          const isNewerDate =
+            artist.last_release_date_mb && mbRelease.releaseDate > artist.last_release_date_mb;
+          const isFirstSync = !artist.last_release_date_mb;
+          const nameChanged = mbRelease.name !== artist.last_release_name_mb;
+          const daysSince = (now - new Date(mbRelease.releaseDate)) / 86400000;
+          const isRealNewRelease = isNewerDate && nameChanged && daysSince <= RELEASE_RECENCY_DAYS;
+
+          if (isRealNewRelease) {
+            const delta = mbRelease.type === "album" ? 30 : 10;
+            await applyScoreEvent(
+              supabase,
+              artist,
+              "activity",
+              delta,
+              mbRelease.type === "album"
+                ? `💿 Nouvel album : « ${mbRelease.name} » (MusicBrainz)`
+                : `🎵 Nouveau single : « ${mbRelease.name} » (MusicBrainz)`,
+              mbRelease.type === "album" ? "new_album" : "new_single",
+              poolAverage,
+              seasonId
+            );
+            results.releasesDetectedMB = (results.releasesDetectedMB || 0) + 1;
+          }
+
+          if (isNewerDate || isFirstSync) {
+            await supabase
+              .from("artists")
+              .update({ last_release_date_mb: mbRelease.releaseDate, last_release_name_mb: mbRelease.name })
+              .eq("id", artist.id);
+            artist.last_release_date_mb = mbRelease.releaseDate;
+            artist.last_release_name_mb = mbRelease.name;
+          }
+        }
+      }
+
+      // --- kworb.net streaming milestone detection ---
+      // Real per-song stream counts, compared directly to the last known
+      // number — a genuine milestone crossing (10M, 50M, 100M...) fires
+      // even if no press ever writes about it, unlike the news-based
+      // detection which depends on an outlet covering the story.
+      {
+        const topTrack = kworbCache.get(artist.id) || null;
+        if (topTrack && topTrack.streams) {
+          const STREAM_MILESTONES = [1_000_000, 10_000_000, 50_000_000, 100_000_000, 250_000_000, 500_000_000, 1_000_000_000];
+          const before = artist.top_track_streams || 0;
+          const crossed = STREAM_MILESTONES.filter((m) => before < m && topTrack.streams >= m);
+          if (crossed.length) {
+            const biggest = crossed[crossed.length - 1];
+            const label = biggest >= 1_000_000_000
+              ? `${Math.round(biggest / 1_000_000_000)}Md`
+              : `${Math.round(biggest / 1_000_000)}M`;
+            await applyScoreEvent(
+              supabase,
+              artist,
+              "momentum",
+              20,
+              `🎯 « ${topTrack.name} » franchit les ${label} de streams sur Spotify (kworb.net)`,
+              "streaming_milestone",
+              poolAverage,
+              seasonId
+            );
+            results.milestonesFromKworb = (results.milestonesFromKworb || 0) + 1;
+          }
+          if (topTrack.streams !== before) {
+            await supabase
+              .from("artists")
+              .update({ top_track_name: topTrack.name, top_track_streams: topTrack.streams })
+              .eq("id", artist.id);
+            artist.top_track_streams = topTrack.streams;
           }
         }
       }

@@ -41,10 +41,21 @@ export default function SyncHealthCard({ runs }) {
       </div>
 
       {last.results?.releaseChecks && (
-        <div className="text-[11px] text-[var(--text-faint)] mb-4">
-          🔄 Vérif. des sorties : groupe {last.results.releaseChecks.group}/
+        <div className="text-[11px] text-[var(--text-faint)] mb-2">
+          🔄 Vérif. des sorties (Spotify) : groupe {last.results.releaseChecks.group}/
           {last.results.releaseChecks.totalGroups} · {last.results.releaseChecks.checkedThisRun} artiste(s)
-          vérifié(s) ce cycle (par rotation, pour ne jamais surcharger Spotify)
+        </div>
+      )}
+      {last.results?.musicBrainzChecks && (
+        <div className="text-[11px] text-[var(--text-faint)] mb-2">
+          🔄 Vérif. de secours (MusicBrainz) : groupe {last.results.musicBrainzChecks.group}/
+          {last.results.musicBrainzChecks.totalGroups} · {last.results.musicBrainzChecks.checkedThisRun} artiste(s)
+        </div>
+      )}
+      {last.results?.kworbChecks && (
+        <div className="text-[11px] text-[var(--text-faint)] mb-4">
+          🔄 Vérif. des streams (kworb.net) : groupe {last.results.kworbChecks.group}/
+          {last.results.kworbChecks.totalGroups} · {last.results.kworbChecks.checkedThisRun} artiste(s)
         </div>
       )}
 
