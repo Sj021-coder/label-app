@@ -263,13 +263,20 @@ async function getRapeliteArtistNews(artistName) {
     .map((i) => ({ ...i, source: "Rapelite" }));
 }
 
+// Booska-P covers broader "cultures urbaines" than just rap (cinéma,
+// sport...) — this feed isn't tied to one artist so there's no name to
+// filter by, but a basic rap-domain keyword check still catches the
+// clearly-unrelated pieces before they ever reach Radar's general ticker.
+const RAP_KEYWORD_RE = /(rap|rappeur|rappeuse|album|clip|mixtape|feat\.?|single|freestyle|\bEP\b)/i;
+
 async function getGeneralRapNews() {
-  // The site's whole feed, unfiltered — a general "actu rap" ticker, not
-  // tied to any one artist. Feeds the Radar's holistic feel.
   const res = await fetch("https://www.booska-p.com/feed/");
   if (!res.ok) return [];
   const xml = await res.text();
-  return parseRssItems(xml, 8).map((i) => ({ ...i, source: "Booska-P" }));
+  return parseRssItems(xml, 15)
+    .filter((i) => RAP_KEYWORD_RE.test(i.title))
+    .slice(0, 8)
+    .map((i) => ({ ...i, source: "Booska-P" }));
 }
 
 async function searchDeezerArtist(name) {

@@ -52,10 +52,17 @@ export default async function RadarPage() {
   // the honest stand-in for "aggregator accounts" (Instagram itself has no
   // free API for third-party accounts; this is where that content is
   // usually sourced from anyway).
+  // Freshness cutoff added on purpose: "8 most recent regardless of age"
+  // meant a quiet news day could leave a week-old article looking current.
+  // If nothing real happened in the last 4 days, showing nothing is more
+  // honest than showing something stale.
+  const fourDaysAgo = new Date();
+  fourDaysAgo.setDate(fourDaysAgo.getDate() - 4);
   const { data: generalNews } = await supabase
     .from("artist_news")
     .select("id, title, url, source, published_at")
     .is("artist_id", null)
+    .gte("published_at", fourDaysAgo.toISOString())
     .order("published_at", { ascending: false })
     .limit(8);
 
@@ -196,7 +203,7 @@ export default async function RadarPage() {
           className="block bg-[var(--surface)] border border-[var(--border)] rounded-2xl px-3.5 py-3 mb-2"
         >
           <div className="text-[10px] font-bold text-[var(--text-faint)] mb-0.5">{n.source}</div>
-          <div className="text-sm leading-tight">{n.title}</div>
+          <div className="text-sm leading-tight line-clamp-2">{n.title}</div>
         </a>
       ))}
     </div>
