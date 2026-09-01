@@ -11,13 +11,13 @@
 //   SPOTIFY_CLIENT_ID
 //   SPOTIFY_CLIENT_SECRET
 //   YOUTUBE_API_KEY
-//   CURRENTS_API_KEY
 //
 // This function bypasses RLS using the service_role key since it runs
 // with no logged-in user — never expose that key to the browser/client.
 
 import { createClient } from "@supabase/supabase-js";
 import { TRANSFER_FREE_PER_WEEK, TRANSFER_BANK_CAP } from "../../lib/gameRules.js";
+import { extractSignal, suggestScoring } from "../../lib/signals/extractSignal.js";
 
 async function getSpotifyToken() {
   const res = await fetch("https://accounts.spotify.com/api/token", {
@@ -244,6 +244,23 @@ async function getBooskaPArtistNews(artistName) {
     .filter((i) => i.title.toLowerCase().includes(nameLc))
     .slice(0, 3)
     .map((i) => ({ ...i, source: "Booska-P" }));
+}
+
+// Rapelite — a second, independent French rap outlet, verified free and
+// working (real WordPress RSS feed). Its value isn't a new kind of data,
+// it's redundancy: a real story Booska-P's editorial team happens to miss
+// still has a chance of being caught here. Same fuzzy-search-then-filter
+// approach — their search returns loosely-related results too.
+async function getRapeliteArtistNews(artistName) {
+  const url = `https://www.rapelite.com/?s=${encodeURIComponent(artistName)}&feed=rss2`;
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const xml = await res.text();
+  const nameLc = artistName.toLowerCase();
+  return parseRssItems(xml, 10)
+    .filter((i) => i.title.toLowerCase().includes(nameLc))
+    .slice(0, 3)
+    .map((i) => ({ ...i, source: "Rapelite" }));
 }
 
 async function getGeneralRapNews() {
@@ -895,13 +912,14 @@ export default async () => {
         }
       }
 
-      // --- News (Google News RSS + Booska-P — both free, no key needed) ---
+      // --- News (Google News + Booska-P + Rapelite — all free, no key) ---
       {
-        const [googleArticles, booskaArticles] = await Promise.all([
+        const [googleArticles, booskaArticles, rapeliteArticles] = await Promise.all([
           getArtistNews(artist.name),
           getBooskaPArtistNews(artist.name).catch(() => []),
+          getRapeliteArtistNews(artist.name).catch(() => []),
         ]);
-        for (const a of [...googleArticles, ...booskaArticles]) {
+        for (const a of [...googleArticles, ...booskaArticles, ...rapeliteArticles]) {
           if (!a.url) continue;
           const { error: newsErr } = await supabase
             .from("artist_news")
@@ -914,8 +932,35 @@ export default async () => {
             })
             .select()
             .single();
-          if (!newsErr) results.newsFound++;
-          // ON CONFLICT (artist_id, url) silently fails via unique constraint — fine, expected for repeats
+          // ON CONFLICT (artist_id, url) fails here via the unique constraint
+          // for an article we've already seen — expected, and the reason
+          // this `continue` is safe: it also means we only ever read a
+          // given headline for meaning ONCE, the first time it's genuinely new.
+          if (newsErr) continue;
+          results.newsFound++;
+
+          // The real connection between news and scoring, finally built:
+          // a genuinely new headline gets read for what it actually says,
+          // not just stored. Only a MILESTONE (a confirmed, already-
+          // happened fact — "« X » passe les 100M streams") scores
+          // automatically. An "announcement" is a claim about the future,
+          // not a confirmed fact — it stays a Pick'em candidate, reviewed
+          // like any other news item, never an automatic score change.
+          const signal = extractSignal(a.title);
+          if (signal.type === "milestone") {
+            const suggestion = suggestScoring(signal);
+            await applyScoreEvent(
+              supabase,
+              artist,
+              suggestion.category,
+              suggestion.delta,
+              `${suggestion.label} (${a.source})`,
+              "streaming_milestone",
+              poolAverage,
+              seasonId
+            );
+            results.milestonesFromNews = (results.milestonesFromNews || 0) + 1;
+          }
         }
       }
       // --- Dynamic market value update ---
