@@ -49,15 +49,6 @@ export async function POST(request) {
 
   const newScore = computeWeightedScore(updatedSubtotals);
 
-  const { error: updateErr } = await supabase
-    .from("artists")
-    .update({ ...updatedSubtotals, score: newScore })
-    .eq("id", artistId);
-
-  if (updateErr) {
-    return NextResponse.json({ error: updateErr.message }, { status: 500 });
-  }
-
   // Tag the event with the current active season, if one exists
   const { data: activeSeason } = await supabase
     .from("seasons")
@@ -65,18 +56,28 @@ export async function POST(request) {
     .eq("is_active", true)
     .single();
 
-  const { error: logErr } = await supabase.from("score_events").insert({
-    artist_id: artistId,
-    event_key: eventKey,
-    label,
-    delta,
-    category,
-    season_id: activeSeason?.id || null,
-    created_by: user.id,
+  // Same atomic RPC the engine uses (migration-atomic-score-event.sql) —
+  // the log entry and the score snapshot land together in one real
+  // transaction, or neither does. This route used to do these as two
+  // separate calls (update, then insert) — the exact non-atomic gap that
+  // was closed everywhere else in the engine but got missed here.
+  const { error: rpcError } = await supabase.rpc("apply_score_event_atomic", {
+    p_artist_id: artistId,
+    p_event_key: eventKey,
+    p_label: label,
+    p_delta: delta,
+    p_category: category,
+    p_season_id: activeSeason?.id || null,
+    p_momentum_score: updatedSubtotals.momentum_score,
+    p_performance_score: updatedSubtotals.performance_score,
+    p_activity_score: updatedSubtotals.activity_score,
+    p_culture_score: updatedSubtotals.culture_score,
+    p_score: newScore,
+    p_created_by: user.id,
   });
 
-  if (logErr) {
-    return NextResponse.json({ error: logErr.message }, { status: 500 });
+  if (rpcError) {
+    return NextResponse.json({ error: rpcError.message }, { status: 500 });
   }
 
   return NextResponse.json({ success: true, newScore });

@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { getAdminContext } from "@/lib/supabase/admin";
 import AdminForm from "./AdminForm";
+import AdminPostAnalyzer from "./AdminPostAnalyzer";
 import AdminPickem from "./AdminPickem";
 import AdminMapping from "./AdminMapping";
 import MetricsPanel from "./MetricsPanel";
@@ -144,6 +145,13 @@ export default async function AdminPage() {
           Moteur de scoring
         </div>
         <AdminForm artists={artists || []} />
+      </div>
+
+      <div className="mt-10 pt-6 border-t border-[var(--border)]">
+        <div className="text-[13px] uppercase tracking-wide text-[var(--text-faint)] font-bold mb-3">
+          Analyser un post (Instagram, TikTok, actu...)
+        </div>
+        <AdminPostAnalyzer artists={artists || []} />
       </div>
 
       <div className="mt-10 pt-6 border-t border-[var(--border)]">
