@@ -40,20 +40,20 @@ export default function SyncHealthCard({ runs }) {
         {last.errors?.length > 0 ? ` · ${last.errors.length} souci(s)` : " · aucun souci"}
       </div>
 
-      {/* A run killed by Netlify's ~60s hard limit shows EXACTLY 60000ms
-          and never gets the chance to log a real error — this happened
-          for real once already. Warning here at 45s means it's visible
-          the moment margin starts disappearing, not several confused
-          messages later trying to guess from a Netlify function log. */}
-      {last.duration_ms >= 45000 && (
+      {/* Since 2026-09-02, the real work runs in daily-sync-worker.mjs as a
+          Netlify BACKGROUND Function — up to 15 minutes (900 000ms), not
+          60 seconds. These thresholds were written for the old 60s ceiling
+          and would falsely alarm on a perfectly healthy 131s run under the
+          new limit — updated to warn near the REAL current ceiling instead. */}
+      {last.duration_ms >= 600000 && (
         <p className="text-[11px] text-[var(--crimson)] font-bold mb-3">
-          ⚠️ Ce cycle a pris {(last.duration_ms / 1000).toFixed(0)}s, proche de la limite de 60s —
-          risque réel d&apos;être coupé en plein milieu si ça continue à grimper.
+          ⚠️ Ce cycle a pris {(last.duration_ms / 1000 / 60).toFixed(1)}min, proche de la limite de
+          15min — risque réel d&apos;être coupé en plein milieu si ça continue à grimper.
         </p>
       )}
-      {last.duration_ms >= 59000 && (
+      {last.duration_ms >= 840000 && (
         <p className="text-[11px] text-[var(--crimson)] font-bold mb-3">
-          🔴 Ce cycle a probablement été interrompu de force par Netlify (durée ≈ 60s) — tout ce
+          🔴 Ce cycle a probablement été interrompu de force par Netlify (durée ≈ 15min) — tout ce
           qu&apos;il devait encore faire après ce point n&apos;a pas eu lieu.
         </p>
       )}
