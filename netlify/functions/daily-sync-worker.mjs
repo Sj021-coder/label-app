@@ -1,0 +1,1376 @@
+// The actual scoring engine — twice-daily, but running as a Netlify
+// BACKGROUND Function (config.background below), not a Scheduled Function.
+//
+// WHY THIS FILE WAS SPLIT OFF (2026-09-02): Netlify Scheduled Functions are
+// hard-capped at 30-60s of execution. As this engine grew (more artists
+// mapped, then MusicBrainz + kworb.net + 3 news sources added), a real run
+// started hitting that ceiling and getting killed mid-work — confirmed live
+// via Netlify's function logs showing an exact `Duration: 60000ms` with no
+// completion, twice, including once right after a "fix" that only reduced
+// batch sizes (didn't remove the actual constraint).
+//
+// The 60-second ceiling was never a real product requirement — nobody
+// decided "score updates must finish in under a minute." It was an
+// inherited limit of the FIRST mechanism this was built on (a synchronous
+// Scheduled Function), never revisited until it broke. Rather than
+// dropping data sources or rationing which ones run when to fit inside
+// that limit, the actual fix removes the limit itself: this file now runs
+// as a Background Function (up to 15 minutes), doing exactly the same
+// work, for every source, every run — nothing removed, nothing rationed.
+//
+// `daily-sync.mjs` is now just a tiny cron-triggered function that wakes
+// this one up. See that file for the trigger side.
+//
+// Required environment variables (set in Netlify > Site settings > Environment variables):
+//   NEXT_PUBLIC_SUPABASE_URL       (already set for the app)
+//   SUPABASE_SERVICE_ROLE_KEY      (from Supabase > Project Settings > API > service_role)
+//   SPOTIFY_CLIENT_ID
+//   SPOTIFY_CLIENT_SECRET
+//   YOUTUBE_API_KEY
+//   SYNC_TRIGGER_SECRET            (NEW — any long random string; must match
+//                                   the same value read by daily-sync.mjs.
+//                                   This endpoint is technically a public
+//                                   URL once deployed, so this stops anyone
+//                                   else on the internet from invoking it
+//                                   and burning our API quota / writing fake
+//                                   score events.)
+//
+// This function bypasses RLS using the service_role key since it runs
+// with no logged-in user — never expose that key to the browser/client.
+
+import { createClient } from "@supabase/supabase-js";
+import { TRANSFER_FREE_PER_WEEK, TRANSFER_BANK_CAP } from "../../lib/gameRules.js";
+import { extractSignal, suggestScoring } from "../../lib/signals/extractSignal.js";
+
+async function getSpotifyToken() {
+  const res = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization:
+        "Basic " +
+        Buffer.from(
+          `${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`
+        ).toString("base64"),
+    },
+    body: "grant_type=client_credentials",
+  });
+  if (!res.ok) throw new Error(`Spotify auth failed: ${res.status}`);
+  const data = await res.json();
+  return data.access_token;
+}
+
+// Throws (with the real HTTP status) instead of silently returning null on
+// failure — a silent null was exactly why "spotifySynced: 0" had no visible
+// cause anywhere: every call could be failing with the same real error and
+// nothing would ever say so. Callers catch this and surface it once.
+async function getSpotifyArtistData(token, spotifyId) {
+  const res = await fetch(`https://api.spotify.com/v1/artists/${spotifyId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Spotify artist fetch failed: ${res.status} ${res.statusText}`);
+  const data = await res.json();
+  return { popularity: data.popularity ?? null, followers: data.followers?.total ?? null };
+}
+
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+// The real fix for both the timeout AND the 429s: Spotify's /v1/artists
+// endpoint accepts up to 50 IDs in ONE call. ~40 individual calls become 1.
+// Returns a Map keyed by spotifyId — missing/invalid IDs are simply absent.
+async function getSpotifyArtistsBatch(token, spotifyIds) {
+  // Now that the mapped pool has crossed 50 artists (Aug 2026 mapping push),
+  // this is 2+ sequential calls, not always 1. Two real bugs that only
+  // start to matter at that point, both fixed here:
+  // 1. No pause between chunks — added one, since a burst of 2 calls back
+  //    to back is exactly the kind of thing Spotify's per-time-window limit
+  //    (confirmed real elsewhere in this file) can flag.
+  // 2. The old version threw on the FIRST failing chunk, which discarded
+  //    data ALREADY fetched from an earlier, successful chunk. Now each
+  //    chunk fails independently — a bad chunk 2 no longer erases chunk 1.
+  const data = new Map();
+  const errors = [];
+  const chunks = chunk(spotifyIds, 50);
+  for (let i = 0; i < chunks.length; i++) {
+    try {
+      const res = await fetch(`https://api.spotify.com/v1/artists?ids=${chunks[i].join(",")}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new Error(`Spotify batch fetch failed: ${res.status} ${res.statusText}`);
+      const json = await res.json();
+      for (const a of json.artists || []) {
+        if (a) data.set(a.id, { popularity: a.popularity ?? null, followers: a.followers?.total ?? null });
+      }
+    } catch (e) {
+      errors.push(e);
+    }
+    if (i < chunks.length - 1) await sleep(300);
+  }
+  return { data, errors };
+}
+
+// Picks the item with the true maximum release_date out of a page of
+// results — release_date strings are ISO-prefixed (YYYY, YYYY-MM, or
+// YYYY-MM-DD), so plain string comparison sorts them correctly even when
+// items mix precisions.
+function pickNewestByDate(items) {
+  if (!items || items.length === 0) return null;
+  return items.reduce((max, item) => (!max || item.release_date > max.release_date ? item : max), null);
+}
+
+async function getLatestRelease(token, spotifyId) {
+  // limit=50, not 1 — real bug fixed here: Spotify's /albums endpoint has
+  // NO documented sort order, so the old code's `items[0]` could just as
+  // easily be the artist's OLDEST album as their newest (confirmed in
+  // production: several artists were frozen on years-old releases while
+  // real new ones existed). Fetching a real page and picking the true max
+  // date costs nothing extra — still exactly 1 HTTP request, just a
+  // bigger response body.
+  const url = `https://api.spotify.com/v1/artists/${spotifyId}/albums?include_groups=album,single&limit=50&market=FR`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Spotify releases fetch failed: ${res.status} ${res.statusText}`);
+  const data = await res.json();
+  const latest = pickNewestByDate(data.items);
+  if (!latest) return null;
+  return {
+    name: latest.name,
+    releaseDate: latest.release_date,
+    releaseDatePrecision: latest.release_date_precision,
+    type: latest.album_type,
+  };
+}
+
+async function getLatestFeature(token, spotifyId) {
+  // "appears_on" = tracks by OTHER artists that this artist is featured on.
+  // Same limit=50 + true-max-date fix as getLatestRelease above — same
+  // underlying bug: `items[0]` here was never guaranteed to be the most
+  // recent feature, just whatever order Spotify happened to return.
+  const url = `https://api.spotify.com/v1/artists/${spotifyId}/albums?include_groups=appears_on&limit=50&market=FR`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Spotify features fetch failed: ${res.status} ${res.statusText}`);
+  const data = await res.json();
+  const latest = pickNewestByDate(data.items);
+  if (!latest) return null;
+  return {
+    name: latest.name,
+    releaseDate: latest.release_date,
+    releaseDatePrecision: latest.release_date_precision,
+    byArtist: latest.artists?.[0]?.name,
+  };
+}
+
+// MusicBrainz — a genuine backup for release detection, not a duplicate
+// of Spotify's. Only ever called for an artist Spotify DIDN'T check this
+// cycle (see the fallback rotation below), so there's no double-counting
+// risk by construction — one or the other runs for a given artist, never
+// both. Free for non-commercial use, but MusicBrainz enforces a real
+// 1-request-per-second limit and requires an identifying User-Agent —
+// both are respected here. NOTE: this endpoint could not be live-tested
+// against a running server before shipping (MusicBrainz returned 503 to a
+// verification request without the full pacing this function uses in
+// production) — built carefully against their long-stable, widely-used
+// documented API shape, but the first real cycle is the actual proof.
+async function getLatestReleaseFromMusicBrainz(artistName) {
+  const url = `https://musicbrainz.org/ws/2/release-group/?query=${encodeURIComponent(
+    `artist:"${artistName}"`
+  )}&fmt=json&limit=25`;
+  const res = await fetch(url, {
+    headers: { "User-Agent": "LABEL-FantasyRapApp/1.0 (contact: samanjmor21@gmail.com)" },
+  });
+  if (!res.ok) throw new Error(`MusicBrainz fetch failed: ${res.status}`);
+  const data = await res.json();
+  const groups = (data["release-groups"] || []).filter((g) => g["first-release-date"]);
+  if (!groups.length) return null;
+  const latest = groups.reduce(
+    (max, g) => (!max || g["first-release-date"] > max["first-release-date"] ? g : max),
+    null
+  );
+  return {
+    name: latest.title,
+    releaseDate: latest["first-release-date"],
+    type: (latest["primary-type"] || "album").toLowerCase(),
+  };
+}
+
+// kworb.net — real per-song Spotify stream counts, keyed by the same
+// Spotify artist ID already stored (verified working directly against a
+// real artist page before writing this). Their own robots.txt explicitly
+// allows automated access (`Allow: /` for every bot) — the one real
+// caveat is this is still an unofficial page, not a documented API, so
+// its HTML structure could change without notice.
+async function getKworbTopTrack(spotifyId) {
+  const res = await fetch(`https://kworb.net/spotify/artist/${spotifyId}.html`);
+  if (!res.ok) return null;
+  const html = await res.text();
+  // Verified against the real page before shipping this (not guessed):
+  // <td>2019/03/22</td><td class="text"><div><a href="...">Song</a></div></td><td>305,841,362</td>
+  // — note the song title sits inside an extra <div>, and some rows have a
+  // "* " prefix before the <a> tag. Takes the row with the highest stream
+  // count — the artist's single biggest song overall, not their most
+  // recent chart entry.
+  const rowRe =
+    /<td>[\d/]+<\/td>\s*<td class="text"><div>(?:\*\s*)?<a[^>]*>([^<]+)<\/a><\/div><\/td>\s*<td>([\d,]+)<\/td>/g;
+  let best = null;
+  let match;
+  while ((match = rowRe.exec(html)) !== null) {
+    const streams = parseInt(match[2].replace(/,/g, ""), 10);
+    if (!Number.isNaN(streams) && (!best || streams > best.streams)) {
+      best = { name: match[1].trim(), streams };
+    }
+  }
+  return best;
+}
+
+// YouTube's channels.list also accepts multiple IDs in one call — same fix
+// as Spotify's batch endpoint, same reason. Returns a Map keyed by channelId.
+async function getYoutubeStatsBatch(channelIds) {
+  const out = new Map();
+  for (const ids of chunk(channelIds, 50)) {
+    const url = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${ids.join(
+      ","
+    )}&key=${process.env.YOUTUBE_API_KEY}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`YouTube batch fetch failed: ${res.status} ${res.statusText}`);
+    const data = await res.json();
+    for (const item of data.items || []) {
+      if (item?.statistics) {
+        out.set(item.id, {
+          viewCount: Number(item.statistics.viewCount || 0),
+          subscriberCount: Number(item.statistics.subscriberCount || 0),
+        });
+      }
+    }
+  }
+  return out;
+}
+
+async function getUpcomingPremieres(channelId) {
+  // Finds scheduled "Premiere" videos — real artists use this to hype a
+  // release before it's actually out. This is the genuine "announced/incoming" signal.
+  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${channelId}&eventType=upcoming&type=video&maxResults=3&key=${process.env.YOUTUBE_API_KEY}`;
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return (data.items || []).map((item) => ({
+    title: item.snippet.title,
+    videoId: item.id.videoId,
+    publishedAt: item.snippet.publishTime,
+  }));
+}
+
+async function getArtistNews(name) {
+  // Google News RSS — genuinely free, no API key needed at all.
+  const url = `https://news.google.com/rss/search?q=${encodeURIComponent(
+    name
+  )}&hl=fr&gl=FR&ceid=FR:fr`;
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const xml = await res.text();
+
+  // Lightweight manual parse — avoids adding an XML dependency for a
+  // simple, predictable RSS structure.
+  const items = [];
+  const itemBlocks = xml.split("<item>").slice(1);
+  for (const block of itemBlocks.slice(0, 5)) {
+    const title = (block.match(/<title>(.*?)<\/title>/s) || [])[1];
+    const link = (block.match(/<link>(.*?)<\/link>/s) || [])[1];
+    const pubDate = (block.match(/<pubDate>(.*?)<\/pubDate>/s) || [])[1];
+    const source = (block.match(/<source[^>]*>(.*?)<\/source>/s) || [])[1];
+    if (title && link) {
+      items.push({
+        title: title.replace(/<!\[CDATA\[|\]\]>/g, "").trim(),
+        url: link.trim(),
+        source: source ? source.replace(/<!\[CDATA\[|\]\]>/g, "").trim() : "Google News",
+        published_at: pubDate ? new Date(pubDate).toISOString() : null,
+      });
+    }
+  }
+  return items;
+}
+
+// --- Booska-P (French rap media) — a real, free, no-key RSS feed. ---
+// This is the honest substitute for "Instagram rap-news accounts": those
+// aren't reachable via any free API (Instagram doesn't expose arbitrary
+// third-party accounts to outside apps), but Booska-P is one of the actual
+// outlets that content like that is usually sourced from in the first place.
+function parseRssItems(xml, max) {
+  const items = [];
+  const blocks = xml.split("<item>").slice(1);
+  for (const block of blocks.slice(0, max)) {
+    const title = (block.match(/<title>(.*?)<\/title>/s) || [])[1];
+    const link = (block.match(/<link>(.*?)<\/link>/s) || [])[1];
+    const pubDate = (block.match(/<pubDate>(.*?)<\/pubDate>/s) || [])[1];
+    if (title && link) {
+      items.push({
+        title: title.replace(/<!\[CDATA\[|\]\]>/g, "").trim(),
+        url: link.trim(),
+        published_at: pubDate ? new Date(pubDate).toISOString() : null,
+      });
+    }
+  }
+  return items;
+}
+
+async function getBooskaPArtistNews(artistName) {
+  // Booska-P's own search is fuzzy (verified: it returns loosely-related
+  // results, not just exact matches — the same relevance risk that got
+  // Currents API dropped). So we search, then keep only items whose TITLE
+  // actually contains the artist's name — a cheap but real relevance filter.
+  const url = `https://www.booska-p.com/?s=${encodeURIComponent(artistName)}&feed=rss2`;
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const xml = await res.text();
+  const nameLc = artistName.toLowerCase();
+  return parseRssItems(xml, 10)
+    .filter((i) => i.title.toLowerCase().includes(nameLc))
+    .slice(0, 3)
+    .map((i) => ({ ...i, source: "Booska-P" }));
+}
+
+// Rapelite — a second, independent French rap outlet, verified free and
+// working (real WordPress RSS feed). Its value isn't a new kind of data,
+// it's redundancy: a real story Booska-P's editorial team happens to miss
+// still has a chance of being caught here. Same fuzzy-search-then-filter
+// approach — their search returns loosely-related results too.
+async function getRapeliteArtistNews(artistName) {
+  const url = `https://www.rapelite.com/?s=${encodeURIComponent(artistName)}&feed=rss2`;
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const xml = await res.text();
+  const nameLc = artistName.toLowerCase();
+  return parseRssItems(xml, 10)
+    .filter((i) => i.title.toLowerCase().includes(nameLc))
+    .slice(0, 3)
+    .map((i) => ({ ...i, source: "Rapelite" }));
+}
+
+// Booska-P covers broader "cultures urbaines" than just rap (cinéma,
+// sport...) — this feed isn't tied to one artist so there's no name to
+// filter by, but a basic rap-domain keyword check still catches the
+// clearly-unrelated pieces before they ever reach Radar's general ticker.
+const RAP_KEYWORD_RE = /(rap|rappeur|rappeuse|album|clip|mixtape|feat\.?|single|freestyle|\bEP\b)/i;
+
+async function getGeneralRapNews() {
+  const res = await fetch("https://www.booska-p.com/feed/");
+  if (!res.ok) return [];
+  const xml = await res.text();
+  return parseRssItems(xml, 15)
+    .filter((i) => RAP_KEYWORD_RE.test(i.title))
+    .slice(0, 8)
+    .map((i) => ({ ...i, source: "Booska-P" }));
+}
+
+async function searchDeezerArtist(name) {
+  // Deezer's public API needs NO authentication for search/artist endpoints.
+  const url = `https://api.deezer.com/search/artist?q=${encodeURIComponent(name)}&limit=1`;
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const data = await res.json();
+  const artist = data.data?.[0];
+  if (!artist) return null;
+  return { id: artist.id, name: artist.name, fans: artist.nb_fan };
+}
+
+async function getDeezerArtistStats(deezerId) {
+  const res = await fetch(`https://api.deezer.com/artist/${deezerId}`);
+  if (!res.ok) return null;
+  const data = await res.json();
+  return {
+    fans: data.nb_fan ?? null,
+    // Free artist photo, straight from Deezer — used to auto-fill faces.
+    picture: data.picture_xl || data.picture_big || data.picture_medium || null,
+  };
+}
+
+async function getDeezerTopTrackRank(deezerId) {
+  // Deezer's "rank" field on a track is a real popularity score — the
+  // closest free proxy we have to true chart performance.
+  const res = await fetch(`https://api.deezer.com/artist/${deezerId}/top?limit=1`);
+  if (!res.ok) return null;
+  const data = await res.json();
+  const track = data.data?.[0];
+  return track ? { rank: track.rank, trackName: track.title } : null;
+}
+
+// ============================================================
+// CONFIGURABLE RULES — tune these without touching the logic below
+// ============================================================
+const RULES = {
+  DECAY_RATE: 0.03, // each category subtotal fades 3% per sync run if not reinforced
+  DOMINANCE_THRESHOLD: 2.5, // an artist scoring 2.5x the pool average is "dominant"
+  DOMINANCE_DAMPENING: 0.6, // dominant artists get only 60% of new positive points
+  VALUE_SENSITIVITY: 50, // higher = value reacts less to a given score swing
+  VALUE_MIN_MULTIPLIER: 0.3, // value can't fall below 30% of base cost
+  VALUE_MAX_MULTIPLIER: 3.0, // value can't rise above 300% of base cost
+};
+
+// A "new" release/feature has to actually be recent, not just newer than
+// our stale baseline — a real bug once let a mis-mapped artist's YEARS-old
+// back catalogue get announced as "just dropped" because it merely sorted
+// higher than what we had stored. See daily-sync's release/feature
+// detection blocks below.
+const RELEASE_RECENCY_DAYS = 30;
+
+// Explainability: turn "value went from 24M to 27M" into a real reason,
+// never a black box. Picks whichever category moved the most this run and
+// describes it in plain language — same categories the score is built from.
+function buildValueReason(artist) {
+  const catDeltas = {
+    momentum: (artist.momentum_score || 0) - (artist._momentumAtRunStart || 0),
+    performance: (artist.performance_score || 0) - (artist._performanceAtRunStart || 0),
+    activity: (artist.activity_score || 0) - (artist._activityAtRunStart || 0),
+    culture: (artist.culture_score || 0) - (artist._cultureAtRunStart || 0),
+  };
+  const labels = {
+    momentum: { up: "🔥 Streams et abonnés en forte hausse", down: "📉 Streams et abonnés en baisse" },
+    performance: { up: "📈 Classements Deezer en progression", down: "📉 Classements Deezer en recul" },
+    activity: { up: "🎵 Nouvelle sortie ou feature récente", down: "🎵 Aucune sortie récente" },
+    culture: { up: "🏆 Actu positive (jalon, award, buzz)", down: "⚠️ Actu négative" },
+  };
+  const entries = Object.entries(catDeltas)
+    .filter(([, v]) => v !== 0)
+    .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+  if (!entries.length) return null;
+  const [cat, val] = entries[0];
+  return labels[cat]?.[val > 0 ? "up" : "down"] || null;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Runs `fn` over `items` in concurrent batches instead of one at a time.
+// This is the real fix for the function timing out: ~100 artists x several
+// sequential API calls each was taking minutes done serially. Batches of
+// BATCH_SIZE run concurrently, so wall time is roughly (count / batchSize)
+// slow-artists instead of ALL of them, one after another.
+//
+// Optional `delayMs` paces batches over TIME, not just concurrency — Spotify
+// kept 429-ing release/feature detection even at low concurrency, which
+// means the real constraint is requests-per-time-window, not requests
+// in-flight at once. A pause between batches respects that directly.
+async function processInBatches(items, batchSize, fn, delayMs = 0) {
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    await Promise.all(batch.map(fn));
+    if (delayMs && i + batchSize < items.length) await sleep(delayMs);
+  }
+}
+
+async function applyScoreEvent(supabase, artist, category, delta, label, eventKey, poolAverage, seasonId) {
+  if (delta === 0) return 0;
+
+  // Anti-dominance: artists already far above the pool average get less
+  // benefit from new positive events — keeps one artist from running away
+  // with the leaderboard purely from early momentum.
+  let effectiveDelta = delta;
+  if (delta > 0 && poolAverage && artist.score > poolAverage * RULES.DOMINANCE_THRESHOLD) {
+    effectiveDelta = Math.round(delta * RULES.DOMINANCE_DAMPENING);
+    if (effectiveDelta === 0) return 0;
+  }
+
+  const field = `${category}_score`;
+  const newSubtotal = (artist[field] || 0) + effectiveDelta;
+
+  const subtotals = {
+    momentum_score: artist.momentum_score || 0,
+    performance_score: artist.performance_score || 0,
+    activity_score: artist.activity_score || 0,
+    culture_score: artist.culture_score || 0,
+    [field]: newSubtotal,
+  };
+
+  const weighted = Math.round(
+    subtotals.momentum_score * 0.4 +
+      subtotals.performance_score * 0.3 +
+      subtotals.activity_score * 0.2 +
+      subtotals.culture_score * 0.1
+  );
+
+  // Both writes happen inside ONE Postgres transaction via this RPC call —
+  // either the log entry AND the snapshot update both land, or neither
+  // does. Closes the non-atomic dual-write gap the pipeline audit flagged:
+  // before, these were two separate network calls and a failure between
+  // them could leave the log and the current-state number silently
+  // diverged. The scoring math itself still lives here in JS, in one place
+  // — the SQL function just writes the two already-computed results together.
+  const dampedNote = effectiveDelta !== delta ? " (dominance-dampened)" : "";
+  const { error: rpcError } = await supabase.rpc("apply_score_event_atomic", {
+    p_artist_id: artist.id,
+    p_event_key: eventKey,
+    p_label: label + dampedNote,
+    p_delta: effectiveDelta,
+    p_category: category,
+    p_season_id: seasonId || null,
+    p_momentum_score: subtotals.momentum_score,
+    p_performance_score: subtotals.performance_score,
+    p_activity_score: subtotals.activity_score,
+    p_culture_score: subtotals.culture_score,
+    p_score: weighted,
+  });
+  if (rpcError) throw new Error(`apply_score_event_atomic failed for ${artist.id}: ${rpcError.message}`);
+
+  // Mutate the in-memory artist object so a SECOND event applied to the
+  // same artist later in this same run builds on the updated subtotal,
+  // instead of silently overwriting it (a real bug fixed here).
+  artist.momentum_score = subtotals.momentum_score;
+  artist.performance_score = subtotals.performance_score;
+  artist.activity_score = subtotals.activity_score;
+  artist.culture_score = subtotals.culture_score;
+  artist.score = weighted;
+
+  return effectiveDelta;
+}
+
+export default async (req) => {
+  // Background Functions are invoked over a real (technically public) URL,
+  // so this checks a shared secret before doing any work — otherwise
+  // anyone who found the URL could trigger paid-quota API calls and write
+  // fake score events. `daily-sync.mjs` (the cron trigger) sends this same
+  // header. A mismatch exits immediately, before touching Supabase or any
+  // external API.
+  const providedSecret = req.headers.get("x-sync-secret");
+  if (!process.env.SYNC_TRIGGER_SECRET || providedSecret !== process.env.SYNC_TRIGGER_SECRET) {
+    console.error("daily-sync-worker: rejected invocation with missing/wrong secret");
+    return new Response("Forbidden", { status: 403 });
+  }
+
+  // Captured before anything else so a run that fails in the first
+  // millisecond still gets a real started_at in sync_runs, not a gap.
+  const startedAt = new Date();
+  const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+
+  // Declared here (not inside the try below) so both the success path AND
+  // the catch block can attach whatever was already collected before a
+  // crash — a fatal error halfway through still reports partial results
+  // instead of nothing, and sync_runs always gets written either way.
+  const results = { spotifySynced: 0, youtubeSynced: 0, newsFound: 0, errors: [] };
+
+  try {
+    const { data: artists, error } = await supabase
+      .from("artists")
+      .select(
+        "id, name, cost, value, spotify_id, youtube_channel_id, deezer_id, image_url, momentum_score, performance_score, activity_score, culture_score, last_spotify_popularity, last_spotify_followers, last_youtube_view_count, last_youtube_subscribers, last_release_date, last_release_name, last_feature_date, last_feature_name, last_deezer_fans, last_deezer_rank, last_release_date_mb, last_release_name_mb, top_track_name, top_track_streams"
+      );
+
+    if (error) {
+      throw new Error(`Failed to load artists: ${error.message}`);
+    }
+
+    let spotifyToken = null;
+    try {
+      spotifyToken = await getSpotifyToken();
+    } catch (e) {
+      console.error("Spotify auth failed, skipping Spotify sync:", e.message);
+    }
+
+    if (!spotifyToken) results.errors.push("Spotify auth failed — see console for the real status code");
+
+  // Dedup so ONE broken Spotify credential doesn't spam the same message
+  // ~100 times (once per artist) — surfaced once, still points at the cause.
+  const spotifyErrorsLogged = new Set();
+  function logSpotifyErrorOnce(e) {
+    const msg = e.message;
+    if (!spotifyErrorsLogged.has(msg)) {
+      spotifyErrorsLogged.add(msg);
+      results.errors.push(msg);
+    }
+  }
+
+  // --- Weekly transfer reset (shared calendar, not a personal rolling clock) ---
+  // Refills everyone's free_transfers TOGETHER, at the same moment the "team"
+  // window (captain + trade) opens for the whole pool — Monday's morning run
+  // only (UTC hour < 12 excludes the 20:00 run so this fires once per week).
+  const now = new Date();
+  if (now.getUTCDay() === 1 && now.getUTCHours() < 12) {
+    const { data: profiles } = await supabase.from("profiles").select("id, free_transfers");
+    await processInBatches(profiles || [], 25, async (p) => {
+      const refreshed = Math.min((p.free_transfers || 0) + TRANSFER_FREE_PER_WEEK, TRANSFER_BANK_CAP);
+      await supabase
+        .from("profiles")
+        .update({ free_transfers: refreshed, last_transfer_refresh: now.toISOString().slice(0, 10) })
+        .eq("id", p.id);
+    });
+    results.transfersReset = (profiles || []).length;
+  }
+
+  // Pool average — used for anti-dominance dampening (computed BEFORE this
+  // run's changes, so it reflects standing coming into today).
+  const poolAverage =
+    artists.reduce((sum, a) => sum + (a.score || 0), 0) / (artists.length || 1);
+
+  // Fetched ONCE per run now, not once per event (used to be a DB round trip
+  // on every single applyScoreEvent call — up to hundreds per run).
+  const { data: activeSeason } = await supabase
+    .from("seasons")
+    .select("id")
+    .eq("is_active", true)
+    .single();
+  const seasonId = activeSeason?.id || null;
+
+  // --- Event decay pass ---
+  // Every category subtotal fades slightly each run unless reinforced by a
+  // new real event this run. This stops an artist's score from being
+  // permanently inflated by something that happened months ago — momentum
+  // has to be sustained, not just accumulated once. Batched (not one artist
+  // at a time) — same fix as the main loop below.
+  await processInBatches(artists, 20, async (artist) => {
+    const decayed = {
+      momentum_score: Math.round((artist.momentum_score || 0) * (1 - RULES.DECAY_RATE)),
+      performance_score: Math.round((artist.performance_score || 0) * (1 - RULES.DECAY_RATE)),
+      activity_score: Math.round((artist.activity_score || 0) * (1 - RULES.DECAY_RATE)),
+      culture_score: Math.round((artist.culture_score || 0) * (1 - RULES.DECAY_RATE)),
+    };
+    const weighted = Math.round(
+      decayed.momentum_score * 0.4 +
+        decayed.performance_score * 0.3 +
+        decayed.activity_score * 0.2 +
+        decayed.culture_score * 0.1
+    );
+    await supabase.from("artists").update({ ...decayed, score: weighted }).eq("id", artist.id);
+    Object.assign(artist, decayed, { score: weighted });
+    artist._scoreAtRunStart = weighted; // baseline for this run's value calc
+    // Per-category baselines too — lets us say WHICH category drove a value
+    // change (momentum vs. a release vs. culture), not just "it moved".
+    artist._momentumAtRunStart = decayed.momentum_score;
+    artist._performanceAtRunStart = decayed.performance_score;
+    artist._activityAtRunStart = decayed.activity_score;
+    artist._cultureAtRunStart = decayed.culture_score;
+  });
+
+  // Batches of BATCH_SIZE run concurrently, so total time is roughly
+  // (100 / BATCH_SIZE) slow-artists instead of all 100 back to back.
+  // 20, not 12: the first real run finished at 57.1s of a 60s ceiling — too
+  // close for comfort. Bigger batches = fewer sequential rounds = more margin,
+  // without going so high it risks tripping a provider's own rate limiting.
+  // (Kept at 20 even now that the ceiling is 15 minutes — this number was
+  // never really about Netlify's limit, it's about not bursting past
+  // providers' own per-time-window rate limits.)
+  const ARTIST_BATCH_SIZE = 20;
+
+  // --- Spotify pre-fetch ---
+  // Popularity/followers now come from ONE bulk call (up to 50 IDs each) —
+  // the real fix, not just gentler pacing. Release/feature detection has no
+  // bulk equivalent in Spotify's API, so those stay per-artist. Confirmed via
+  // a real run: even 4-at-a-time still got 429'd, meaning the real limit is
+  // requests-PER-TIME, not requests-in-flight — so this is now small batches
+  // (2) AND paced with a real pause between them, not just lower concurrency.
+  // Delay bumped 400ms -> 700ms (Aug 2026): the mapped pool roughly tripled
+  // in one push (19 -> 50+ artists), which roughly tripled the total number
+  // of release/feature calls made at this same pacing — confirmed via a
+  // real run hitting 429 on both calls at 400ms once volume grew this much.
+  const SPOTIFY_BATCH_SIZE = 2;
+  const SPOTIFY_BATCH_DELAY_MS = 700;
+  const spotifyCache = new Map();
+  // Tracks who Spotify's release rotation actually covers this run — used
+  // right after this block to hand MusicBrainz exactly the artists Spotify
+  // DIDN'T check, so the two sources can never fire for the same artist in
+  // the same cycle (no double-counting possible, by construction).
+  const spotifyCheckedThisRun = new Set();
+  if (spotifyToken) {
+    const spotifyArtists = artists.filter((a) => a.spotify_id);
+    const { data: batchData, errors: batchErrors } = await getSpotifyArtistsBatch(
+      spotifyToken,
+      spotifyArtists.map((a) => a.spotify_id)
+    );
+    for (const e of batchErrors) logSpotifyErrorOnce(e);
+    for (const artist of spotifyArtists) {
+      spotifyCache.set(artist.id, { data: batchData.get(artist.spotify_id) || null });
+    }
+
+    // Real scaling fix, not just a bigger pause: popularity/followers above
+    // covers EVERY mapped artist every run (cheap — one bulk call). But
+    // release/feature has no bulk endpoint at all, so checking everyone
+    // every run means the call volume grows in lockstep with the pool —
+    // fine at 50 artists, guaranteed to blow the ~60s run ceiling (and
+    // Spotify's rate limit) at 1000. So this checks a bounded SLICE each
+    // run and rotates which slice, based on time — not a stored counter,
+    // so no new DB state needed. At 100 artists that's full coverage every
+    // ~1.5 runs (same-day freshness); at 1000 it's roughly every 12 days
+    // per artist instead of every run — slower detection at real scale,
+    // but the run itself never breaks, which matters more.
+    const RELEASE_CHECK_BATCH_LIMIT = 40;
+    const totalGroups = Math.max(1, Math.ceil(spotifyArtists.length / RELEASE_CHECK_BATCH_LIMIT));
+    const runIndex = Math.floor(now.getTime() / (12 * 60 * 60 * 1000)); // ticks once per scheduled run (8h/20h UTC)
+    const group = runIndex % totalGroups;
+    const releaseCheckArtists = spotifyArtists.slice(
+      group * RELEASE_CHECK_BATCH_LIMIT,
+      (group + 1) * RELEASE_CHECK_BATCH_LIMIT
+    );
+
+    // Visible in sync_runs/the Admin health card — so "is the rotation
+    // actually rotating" is checkable at a glance, not just trusted blind.
+    results.releaseChecks = { checkedThisRun: releaseCheckArtists.length, group: group + 1, totalGroups };
+    for (const a of releaseCheckArtists) spotifyCheckedThisRun.add(a.id);
+
+    await processInBatches(releaseCheckArtists, SPOTIFY_BATCH_SIZE, async (artist) => {
+      const entry = spotifyCache.get(artist.id) || {};
+      try {
+        entry.release = await getLatestRelease(spotifyToken, artist.spotify_id);
+      } catch (e) {
+        logSpotifyErrorOnce(e);
+      }
+      try {
+        entry.feature = await getLatestFeature(spotifyToken, artist.spotify_id);
+      } catch (e) {
+        logSpotifyErrorOnce(e);
+      }
+      spotifyCache.set(artist.id, entry);
+    }, SPOTIFY_BATCH_DELAY_MS);
+  }
+
+  // --- MusicBrainz fallback pre-fetch ---
+  // MusicBrainz's 1-request-per-second limit is fully SEQUENTIAL (no
+  // concurrency possible, unlike everything else in this file), so every
+  // artist checked here is guaranteed wall-clock time, not just API load.
+  // With the 15-minute ceiling this no longer needs to be rationed to a
+  // morning-only half-footprint purely to survive the run — kept as a
+  // rotation still (see comment below) since MusicBrainz's own 1/sec limit
+  // means checking the FULL pool every run would take minutes on its own
+  // for no real benefit (release dates don't change that often).
+  const musicBrainzCache = new Map();
+  const kworbCache = new Map();
+  const isMorningRun = now.getUTCHours() < 12;
+  if (isMorningRun) {
+    const MUSICBRAINZ_CHECK_LIMIT = 4;
+    const mbCandidates = artists.filter((a) => !spotifyCheckedThisRun.has(a.id));
+    const mbTotalGroups = Math.max(1, Math.ceil(mbCandidates.length / MUSICBRAINZ_CHECK_LIMIT));
+    const mbRunIndex = Math.floor(now.getTime() / (24 * 60 * 60 * 1000)); // once/day now, not once/cycle
+    const mbGroup = mbRunIndex % mbTotalGroups;
+    const mbCheckArtists = mbCandidates.slice(
+      mbGroup * MUSICBRAINZ_CHECK_LIMIT,
+      (mbGroup + 1) * MUSICBRAINZ_CHECK_LIMIT
+    );
+    results.musicBrainzChecks = { checkedThisRun: mbCheckArtists.length, group: mbGroup + 1, totalGroups: mbTotalGroups };
+    for (const artist of mbCheckArtists) {
+      try {
+        const release = await getLatestReleaseFromMusicBrainz(artist.name);
+        if (release) musicBrainzCache.set(artist.id, release);
+      } catch (e) {
+        results.errors.push(`MusicBrainz: ${e.message}`);
+      }
+      await sleep(1100); // hard limit is 1/sec — 1100ms leaves real margin
+    }
+  }
+
+  // --- kworb.net pre-fetch (real per-song stream counts) ---
+  // Their robots.txt allows automated access with no stated rate limit;
+  // kept morning-only + rotated for the same reason as MusicBrainz above —
+  // no real benefit to checking every artist every run, stream counts move
+  // slowly day to day.
+  if (isMorningRun) {
+    const KWORB_CHECK_LIMIT = 15;
+    const kworbArtists = artists.filter((a) => a.spotify_id);
+    const kworbTotalGroups = Math.max(1, Math.ceil(kworbArtists.length / KWORB_CHECK_LIMIT));
+    const kworbRunIndex = Math.floor(now.getTime() / (24 * 60 * 60 * 1000));
+    const kworbGroup = kworbRunIndex % kworbTotalGroups;
+    const kworbCheckArtists = kworbArtists.slice(
+      kworbGroup * KWORB_CHECK_LIMIT,
+      (kworbGroup + 1) * KWORB_CHECK_LIMIT
+    );
+    results.kworbChecks = { checkedThisRun: kworbCheckArtists.length, group: kworbGroup + 1, totalGroups: kworbTotalGroups };
+    await processInBatches(kworbCheckArtists, 5, async (artist) => {
+      try {
+        const topTrack = await getKworbTopTrack(artist.spotify_id);
+        if (topTrack) kworbCache.set(artist.id, topTrack);
+      } catch (e) {
+        results.errors.push(`kworb: ${e.message}`);
+      }
+    }, 300);
+  }
+
+  // --- YouTube pre-fetch — same bulk-call fix ---
+  // Upcoming-premiere detection (search.list) has no bulk equivalent and
+  // stays per-channel inside the main loop; it was never the bottleneck.
+  const youtubeCache = new Map();
+  const youtubeArtists = artists.filter((a) => a.youtube_channel_id);
+  if (youtubeArtists.length) {
+    try {
+      const batchStats = await getYoutubeStatsBatch(youtubeArtists.map((a) => a.youtube_channel_id));
+      for (const artist of youtubeArtists) {
+        youtubeCache.set(artist.id, batchStats.get(artist.youtube_channel_id) || null);
+      }
+    } catch (e) {
+      results.errors.push(e.message);
+    }
+  }
+
+  async function processArtist(artist) {
+    try {
+      // --- Spotify popularity + followers -> Momentum (pre-fetched above) ---
+      if (spotifyToken && artist.spotify_id) {
+        const spotifyData = spotifyCache.get(artist.id)?.data || null;
+        if (spotifyData) {
+          if (spotifyData.popularity !== null) {
+            if (artist.last_spotify_popularity !== null && artist.last_spotify_popularity !== undefined) {
+              const delta = spotifyData.popularity - artist.last_spotify_popularity;
+              if (delta !== 0) {
+                await applyScoreEvent(
+                  supabase,
+                  artist,
+                  "momentum",
+                  delta,
+                  delta > 0
+                    ? `🔥 Trending up on Spotify (+${delta})`
+                    : `📉 Cooling off on Spotify (${delta})`,
+                  "stream_tick",
+                  poolAverage,
+                  seasonId
+                );
+                results.spotifySynced++;
+              }
+            }
+          }
+          if (spotifyData.followers !== null) {
+            if (artist.last_spotify_followers) {
+              const rawDelta = spotifyData.followers - artist.last_spotify_followers;
+              const scaledDelta = Math.max(-8, Math.min(8, Math.round(rawDelta / 1000)));
+              if (scaledDelta !== 0) {
+                await applyScoreEvent(
+                  supabase,
+                  artist,
+                  "momentum",
+                  scaledDelta,
+                  scaledDelta > 0
+                    ? `👥 Gaining new Spotify followers`
+                    : `👥 Losing some Spotify followers`,
+                  "stream_tick",
+                  poolAverage,
+                  seasonId
+                );
+              }
+            }
+          }
+          await supabase
+            .from("artists")
+            .update({
+              last_spotify_popularity: spotifyData.popularity,
+              last_spotify_followers: spotifyData.followers,
+              last_synced_at: new Date().toISOString(),
+            })
+            .eq("id", artist.id);
+        }
+      }
+
+      // --- YouTube view + subscriber growth -> Momentum (pre-fetched above) ---
+      if (artist.youtube_channel_id) {
+        const ytStats = youtubeCache.get(artist.id) || null;
+        if (ytStats) {
+          if (artist.last_youtube_view_count) {
+            const rawDelta = ytStats.viewCount - artist.last_youtube_view_count;
+            const scaledDelta = Math.max(-10, Math.min(10, Math.round(rawDelta / 100000)));
+            if (scaledDelta !== 0) {
+              await applyScoreEvent(
+                supabase,
+                artist,
+                "momentum",
+                scaledDelta,
+                scaledDelta > 0
+                  ? `▶️ YouTube views climbing fast`
+                  : `▶️ YouTube views slowing down`,
+                "view_spike",
+                poolAverage,
+                seasonId
+              );
+              results.youtubeSynced++;
+            }
+          }
+          if (artist.last_youtube_subscribers) {
+            const rawDelta = ytStats.subscriberCount - artist.last_youtube_subscribers;
+            const scaledDelta = Math.max(-6, Math.min(6, Math.round(rawDelta / 500)));
+            if (scaledDelta !== 0) {
+              await applyScoreEvent(
+                supabase,
+                artist,
+                "momentum",
+                scaledDelta,
+                scaledDelta > 0
+                  ? `🔔 New YouTube subscribers coming in`
+                  : `🔔 YouTube subscriber growth slowing`,
+                "view_spike",
+                poolAverage,
+                seasonId
+              );
+            }
+          }
+          await supabase
+            .from("artists")
+            .update({
+              last_youtube_view_count: ytStats.viewCount,
+              last_youtube_subscribers: ytStats.subscriberCount,
+            })
+            .eq("id", artist.id);
+        }
+
+        // --- Upcoming premiere detection (the "incoming" signal) ---
+        const premieres = await getUpcomingPremieres(artist.youtube_channel_id);
+        for (const p of premieres) {
+          if (!p.publishedAt) continue;
+          const { error: upErr } = await supabase.from("upcoming_releases").insert({
+            artist_id: artist.id,
+            title: p.title,
+            scheduled_at: p.publishedAt,
+            source: "youtube_premiere",
+            video_url: `https://www.youtube.com/watch?v=${p.videoId}`,
+          });
+          if (!upErr) results.upcomingDetected = (results.upcomingDetected || 0) + 1;
+          // unique constraint silently skips duplicates on repeat syncs
+        }
+      }
+
+      // --- Deezer fan count -> Momentum, top-track rank -> Performance ---
+      // (first genuinely automated Performance-category signal, no key needed)
+      {
+        let deezerId = artist.deezer_id;
+        if (!deezerId) {
+          const found = await searchDeezerArtist(artist.name);
+          if (found) {
+            deezerId = found.id;
+            await supabase.from("artists").update({ deezer_id: deezerId }).eq("id", artist.id);
+          }
+        }
+        if (deezerId) {
+          const stats = await getDeezerArtistStats(deezerId);
+          // Auto-fill the artist's face from Deezer if we don't have one yet.
+          // This is what makes faces "just appear" for any new artist — no manual step.
+          if (stats && stats.picture && !artist.image_url) {
+            await supabase
+              .from("artists")
+              .update({ image_url: stats.picture })
+              .eq("id", artist.id);
+            artist.image_url = stats.picture;
+          }
+          if (stats && stats.fans !== null) {
+            if (artist.last_deezer_fans) {
+              const rawDelta = stats.fans - artist.last_deezer_fans;
+              const scaledDelta = Math.max(-6, Math.min(6, Math.round(rawDelta / 1000)));
+              if (scaledDelta !== 0) {
+                await applyScoreEvent(
+                  supabase,
+                  artist,
+                  "momentum",
+                  scaledDelta,
+                  scaledDelta > 0 ? `🎧 Growing on Deezer` : `🎧 Slowing on Deezer`,
+                  "stream_tick",
+                  poolAverage,
+                  seasonId
+                );
+              }
+            }
+            await supabase.from("artists").update({ last_deezer_fans: stats.fans }).eq("id", artist.id);
+          }
+
+          const topTrack = await getDeezerTopTrackRank(deezerId);
+          if (topTrack && topTrack.rank !== null) {
+            if (artist.last_deezer_rank) {
+              const rawDelta = topTrack.rank - artist.last_deezer_rank;
+              const scaledDelta = Math.max(-8, Math.min(8, Math.round(rawDelta / 5000)));
+              if (scaledDelta !== 0) {
+                await applyScoreEvent(
+                  supabase,
+                  artist,
+                  "performance",
+                  scaledDelta,
+                  scaledDelta > 0
+                    ? `📈 "${topTrack.trackName}" climbing on Deezer`
+                    : `📉 "${topTrack.trackName}" fading on Deezer`,
+                  "chart_up",
+                  poolAverage,
+                  seasonId
+                );
+              }
+            }
+            await supabase.from("artists").update({ last_deezer_rank: topTrack.rank }).eq("id", artist.id);
+          }
+        }
+      }
+
+      // --- New release detection -> Activity (pre-fetched above) ---
+      if (spotifyToken && artist.spotify_id) {
+        const release = spotifyCache.get(artist.id)?.release || null;
+        if (release && release.releaseDate) {
+          const isNewerDate = artist.last_release_date && release.releaseDate > artist.last_release_date;
+          const isFirstSync = !artist.last_release_date;
+          const nameChanged = release.name !== artist.last_release_name;
+          const daysSinceRelease = (now - new Date(release.releaseDate)) / 86400000;
+
+          // A date sorting higher than our baseline is NOT enough on its
+          // own to call something "new" — that's exactly the bug that let
+          // a mis-mapped artist's years-old back catalogue get announced
+          // as a fresh drop (it merely sorted higher than our stale
+          // baseline). Real news also has to be genuinely recent AND a
+          // different release by name, so a reissue/remaster with a
+          // bumped date can't re-fire the same event.
+          const isRealNewRelease = isNewerDate && nameChanged && daysSinceRelease <= RELEASE_RECENCY_DAYS;
+
+          if (isRealNewRelease) {
+            const delta = release.type === "album" ? 30 : 10; // album vs single
+            await applyScoreEvent(
+              supabase,
+              artist,
+              "activity",
+              delta,
+              release.type === "album"
+                ? `💿 Nouvel album : « ${release.name} »`
+                : `🎵 Nouveau single : « ${release.name} »`,
+              release.type === "album" ? "new_album" : "new_single",
+              poolAverage,
+              seasonId
+            );
+            results.releasesDetected = (results.releasesDetected || 0) + 1;
+          }
+
+          // Baseline advances whenever the date moved forward at all, even
+          // when it wasn't recent enough to score — otherwise the same
+          // stale gap would keep re-evaluating (and re-failing the
+          // recency check) forever. Written back onto the in-memory
+          // `artist` object too (missing before) so a second event later
+          // in this same run sees the fresh baseline, not the one loaded
+          // at the top of the run.
+          if (isNewerDate || isFirstSync) {
+            await supabase
+              .from("artists")
+              .update({ last_release_date: release.releaseDate, last_release_name: release.name })
+              .eq("id", artist.id);
+            artist.last_release_date = release.releaseDate;
+            artist.last_release_name = release.name;
+          }
+        }
+      }
+
+      // --- New feature detection ("appears_on") -> Activity (pre-fetched above) ---
+      if (spotifyToken && artist.spotify_id) {
+        const feature = spotifyCache.get(artist.id)?.feature || null;
+        if (feature && feature.releaseDate) {
+          const isNewerDate = artist.last_feature_date && feature.releaseDate > artist.last_feature_date;
+          const isFirstFeatureSync = !artist.last_feature_date;
+          const nameChanged = feature.name !== artist.last_feature_name;
+          const daysSinceFeature = (now - new Date(feature.releaseDate)) / 86400000;
+          const isRealNewFeature = isNewerDate && nameChanged && daysSinceFeature <= RELEASE_RECENCY_DAYS;
+
+          if (isRealNewFeature) {
+            await applyScoreEvent(
+              supabase,
+              artist,
+              "activity",
+              10,
+              `🤝 Featuring : « ${feature.name} »${feature.byArtist ? ` avec ${feature.byArtist}` : ""}`,
+              "new_feature",
+              poolAverage,
+              seasonId
+            );
+            results.featuresDetected = (results.featuresDetected || 0) + 1;
+          }
+
+          if (isNewerDate || isFirstFeatureSync) {
+            await supabase
+              .from("artists")
+              .update({ last_feature_date: feature.releaseDate, last_feature_name: feature.name })
+              .eq("id", artist.id);
+            artist.last_feature_date = feature.releaseDate;
+            artist.last_feature_name = feature.name;
+          }
+        }
+      }
+
+      // --- MusicBrainz release detection (fallback only — see pre-fetch
+      // above for exactly which artists this runs for). Same recency +
+      // name-change guard as the Spotify path, same reasoning: a date
+      // merely sorting higher than a stale baseline isn't "new" on its own. ---
+      {
+        const mbRelease = musicBrainzCache.get(artist.id) || null;
+        if (mbRelease && mbRelease.releaseDate) {
+          const isNewerDate =
+            artist.last_release_date_mb && mbRelease.releaseDate > artist.last_release_date_mb;
+          const isFirstSync = !artist.last_release_date_mb;
+          const nameChanged = mbRelease.name !== artist.last_release_name_mb;
+          const daysSince = (now - new Date(mbRelease.releaseDate)) / 86400000;
+          const isRealNewRelease = isNewerDate && nameChanged && daysSince <= RELEASE_RECENCY_DAYS;
+
+          if (isRealNewRelease) {
+            const delta = mbRelease.type === "album" ? 30 : 10;
+            await applyScoreEvent(
+              supabase,
+              artist,
+              "activity",
+              delta,
+              mbRelease.type === "album"
+                ? `💿 Nouvel album : « ${mbRelease.name} » (MusicBrainz)`
+                : `🎵 Nouveau single : « ${mbRelease.name} » (MusicBrainz)`,
+              mbRelease.type === "album" ? "new_album" : "new_single",
+              poolAverage,
+              seasonId
+            );
+            results.releasesDetectedMB = (results.releasesDetectedMB || 0) + 1;
+          }
+
+          if (isNewerDate || isFirstSync) {
+            await supabase
+              .from("artists")
+              .update({ last_release_date_mb: mbRelease.releaseDate, last_release_name_mb: mbRelease.name })
+              .eq("id", artist.id);
+            artist.last_release_date_mb = mbRelease.releaseDate;
+            artist.last_release_name_mb = mbRelease.name;
+          }
+        }
+      }
+
+      // --- kworb.net streaming milestone detection ---
+      // Real per-song stream counts, compared directly to the last known
+      // number — a genuine milestone crossing (10M, 50M, 100M...) fires
+      // even if no press ever writes about it, unlike the news-based
+      // detection which depends on an outlet covering the story.
+      {
+        const topTrack = kworbCache.get(artist.id) || null;
+        if (topTrack && topTrack.streams) {
+          const STREAM_MILESTONES = [1_000_000, 10_000_000, 50_000_000, 100_000_000, 250_000_000, 500_000_000, 1_000_000_000];
+          const before = artist.top_track_streams || 0;
+          const crossed = STREAM_MILESTONES.filter((m) => before < m && topTrack.streams >= m);
+          if (crossed.length) {
+            const biggest = crossed[crossed.length - 1];
+            const label = biggest >= 1_000_000_000
+              ? `${Math.round(biggest / 1_000_000_000)}Md`
+              : `${Math.round(biggest / 1_000_000)}M`;
+            await applyScoreEvent(
+              supabase,
+              artist,
+              "momentum",
+              20,
+              `🎯 « ${topTrack.name} » franchit les ${label} de streams sur Spotify (kworb.net)`,
+              "streaming_milestone",
+              poolAverage,
+              seasonId
+            );
+            results.milestonesFromKworb = (results.milestonesFromKworb || 0) + 1;
+          }
+          if (topTrack.streams !== before) {
+            await supabase
+              .from("artists")
+              .update({ top_track_name: topTrack.name, top_track_streams: topTrack.streams })
+              .eq("id", artist.id);
+            artist.top_track_streams = topTrack.streams;
+          }
+        }
+      }
+
+      // --- News (Google News + Booska-P + Rapelite — all free, no key) ---
+      {
+        const [googleArticles, booskaArticles, rapeliteArticles] = await Promise.all([
+          getArtistNews(artist.name),
+          getBooskaPArtistNews(artist.name).catch(() => []),
+          getRapeliteArtistNews(artist.name).catch(() => []),
+        ]);
+        for (const a of [...googleArticles, ...booskaArticles, ...rapeliteArticles]) {
+          if (!a.url) continue;
+          const { error: newsErr } = await supabase
+            .from("artist_news")
+            .insert({
+              artist_id: artist.id,
+              title: a.title,
+              url: a.url,
+              source: a.source,
+              published_at: a.published_at,
+            })
+            .select()
+            .single();
+          // ON CONFLICT (artist_id, url) fails here via the unique constraint
+          // for an article we've already seen — expected, and the reason
+          // this `continue` is safe: it also means we only ever read a
+          // given headline for meaning ONCE, the first time it's genuinely new.
+          if (newsErr) continue;
+          results.newsFound++;
+
+          // The real connection between news and scoring, finally built:
+          // a genuinely new headline gets read for what it actually says,
+          // not just stored. Only a MILESTONE (a confirmed, already-
+          // happened fact — "« X » passe les 100M streams") scores
+          // automatically. An "announcement" is a claim about the future,
+          // not a confirmed fact — it stays a Pick'em candidate, reviewed
+          // like any other news item, never an automatic score change.
+          const signal = extractSignal(a.title);
+          if (signal.type === "milestone") {
+            const suggestion = suggestScoring(signal);
+            await applyScoreEvent(
+              supabase,
+              artist,
+              suggestion.category,
+              suggestion.delta,
+              `${suggestion.label} (${a.source})`,
+              "streaming_milestone",
+              poolAverage,
+              seasonId
+            );
+            results.milestonesFromNews = (results.milestonesFromNews || 0) + 1;
+          }
+        }
+      }
+      // --- Dynamic market value update ---
+      // artist.score has been mutated in-memory by every applyScoreEvent
+      // call above (including decay) — compare to the pre-run baseline to
+      // get this run's net movement, then nudge value proportionally.
+      const netMovement = artist.score - (artist._scoreAtRunStart ?? artist.score);
+      if (netMovement !== 0 && artist.cost) {
+        const currentValue = artist.value ?? artist.cost;
+        const proposedValue = currentValue * (1 + netMovement / RULES.VALUE_SENSITIVITY);
+        const newValue = Math.round(
+          Math.max(
+            artist.cost * RULES.VALUE_MIN_MULTIPLIER,
+            Math.min(artist.cost * RULES.VALUE_MAX_MULTIPLIER, proposedValue)
+          )
+        );
+        if (newValue !== currentValue) {
+          const reason = buildValueReason(artist);
+          await supabase
+            .from("artists")
+            .update({ value: newValue, value_reason: reason, value_reason_at: new Date().toISOString() })
+            .eq("id", artist.id);
+        }
+      }
+      // --- Milestones (round-number score thresholds) ---
+      const MILESTONE_THRESHOLDS = [50, 100, 250, 500, 1000, 2000];
+      const scoreBefore = artist._scoreAtRunStart ?? 0;
+      for (const threshold of MILESTONE_THRESHOLDS) {
+        if (scoreBefore < threshold && artist.score >= threshold) {
+          const { error: msErr } = await supabase
+            .from("milestones")
+            .insert({ artist_id: artist.id, threshold });
+          if (!msErr) {
+            await applyScoreEvent(
+              supabase,
+              artist,
+              "culture",
+              5,
+              `🏆 Passed ${threshold} points!`,
+              "viral",
+              poolAverage,
+              seasonId
+            );
+            results.milestonesHit = (results.milestonesHit || 0) + 1;
+          }
+          // unique constraint silently skips if already awarded — safe to retry
+        }
+      }
+    } catch (e) {
+      results.errors.push(`${artist.name}: ${e.message}`);
+    }
+  }
+
+  await processInBatches(artists, ARTIST_BATCH_SIZE, processArtist);
+
+  // --- General rap news ticker (Booska-P feed, not tied to one artist) ---
+  // Feeds the Radar's "Actu rap" block — the holistic, non-artist-specific
+  // signal. Manual dedupe by URL since a null artist_id defeats the table's
+  // (artist_id, url) unique constraint (Postgres treats every NULL as distinct).
+  try {
+    const generalNews = await getGeneralRapNews();
+    for (const n of generalNews) {
+      if (!n.url) continue;
+      const { data: existing } = await supabase
+        .from("artist_news")
+        .select("id")
+        .eq("url", n.url)
+        .limit(1);
+      if (existing && existing.length) continue;
+      await supabase.from("artist_news").insert({
+        artist_id: null,
+        title: n.title,
+        url: n.url,
+        source: n.source,
+        published_at: n.published_at,
+      });
+    }
+  } catch (e) {
+    results.errors.push(`general news: ${e.message}`);
+  }
+
+  // --- Weekly Award: "Most Momentum This Week" ---
+  // Computed once per run across the whole pool, upserted so there's
+  // always exactly one current leader shown for the active week.
+  try {
+    const now = new Date();
+    const dayOfWeek = now.getUTCDay(); // 0 = Sunday
+    const mondayOffset = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+    const weekStart = new Date(now);
+    weekStart.setUTCDate(now.getUTCDate() - mondayOffset);
+    const weekStartStr = weekStart.toISOString().slice(0, 10);
+
+    const { data: weekEvents } = await supabase
+      .from("score_events")
+      .select("artist_id, delta")
+      .gte("created_at", weekStart.toISOString());
+
+    const totals = {};
+    for (const ev of weekEvents || []) {
+      totals[ev.artist_id] = (totals[ev.artist_id] || 0) + ev.delta;
+    }
+    const sorted = Object.entries(totals).sort((a, b) => b[1] - a[1]);
+    if (sorted.length > 0 && sorted[0][1] > 0) {
+      const [topArtistId, topValue] = sorted[0];
+      await supabase.from("weekly_awards").upsert(
+        {
+          award_type: "most_momentum",
+          artist_id: topArtistId,
+          week_start: weekStartStr,
+          value: topValue,
+          computed_at: new Date().toISOString(),
+        },
+        { onConflict: "award_type,week_start" }
+      );
+    }
+  } catch (e) {
+    results.errors.push(`weekly award: ${e.message}`);
+  }
+
+    console.log("Daily sync complete:", JSON.stringify(results));
+    await logSyncRun(supabase, startedAt, true, results);
+    return new Response(JSON.stringify(results), {
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    // A fatal, unexpected error anywhere above lands here. The run still
+    // gets logged — as a failure, with whatever partial results were
+    // collected before the crash — so a broken run shows up red on the
+    // Admin health card instead of just silently never finishing.
+    results.errors.push(`FATAL: ${e.message}`);
+    console.error("Daily sync FAILED:", e.message);
+    await logSyncRun(supabase, startedAt, false, results);
+    return new Response(JSON.stringify({ ...results, fatal: e.message }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+};
+
+// Writes one row per run, success or failure, so the Admin health card can
+// show "is the engine actually alive" at a glance instead of everyone just
+// hoping the twice-daily cron fired. Wrapped in its own try/catch — a
+// logging failure must never be what makes the whole function report broken.
+async function logSyncRun(supabase, startedAt, success, results) {
+  const finishedAt = new Date();
+  try {
+    await supabase.from("sync_runs").insert({
+      started_at: startedAt.toISOString(),
+      finished_at: finishedAt.toISOString(),
+      duration_ms: finishedAt.getTime() - startedAt.getTime(),
+      success,
+      errors: results.errors || [],
+      results,
+    });
+  } catch (e) {
+    console.error("Failed to log sync_runs (non-fatal):", e.message);
+  }
+}
+
+// Background Function, not Scheduled — up to 15 minutes instead of 30-60s.
+// No `schedule` here on purpose: Netlify doesn't support combining the two,
+// so `daily-sync.mjs` (a tiny Scheduled Function) wakes this one up instead.
+export const config = {
+  background: true,
+};
