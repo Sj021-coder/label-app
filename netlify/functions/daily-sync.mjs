@@ -694,62 +694,67 @@ export default async () => {
   }
 
   // --- MusicBrainz fallback pre-fetch ---
-  // Only for artists Spotify did NOT check this run (no spotify_id at all,
-  // or simply outside this cycle's rotation slice) — never the same
-  // artist as the Spotify release check in the same run. Kept deliberately
-  // small: MusicBrainz's 1-request-per-second limit is fully SEQUENTIAL
-  // (no concurrency possible, unlike everything else in this file), so
-  // even a small number here adds real wall-clock time on top of a run
-  // that was already using more than half its ~60s budget. 8, not 15 —
-  // slower full rotation through fallback candidates, but real margin
-  // kept against the exact timeout bug this project already fixed once.
+  // REAL INCIDENT, fixed here: this pass (plus kworb below) pushed a real
+  // run to hit Netlify's 60-second ceiling and get killed outright —
+  // confirmed from the function log showing a hard "Duration: 60000ms"
+  // with no completion, the exact timeout signature this project already
+  // fixed once before. Two changes to actually restore margin, not just
+  // shrink numbers: (1) only runs on the MORNING cycle now, not both —
+  // halves its footprint across the day for free — and (2) the batch
+  // itself is much smaller. MusicBrainz's 1-request-per-second limit is
+  // fully SEQUENTIAL (no concurrency possible, unlike everything else in
+  // this file), so every artist checked here is guaranteed wall-clock
+  // time, not just API load.
   const musicBrainzCache = new Map();
-  const MUSICBRAINZ_CHECK_LIMIT = 8;
-  const mbCandidates = artists.filter((a) => !spotifyCheckedThisRun.has(a.id));
-  const mbTotalGroups = Math.max(1, Math.ceil(mbCandidates.length / MUSICBRAINZ_CHECK_LIMIT));
-  const mbRunIndex = Math.floor(now.getTime() / (12 * 60 * 60 * 1000));
-  const mbGroup = mbRunIndex % mbTotalGroups;
-  const mbCheckArtists = mbCandidates.slice(
-    mbGroup * MUSICBRAINZ_CHECK_LIMIT,
-    (mbGroup + 1) * MUSICBRAINZ_CHECK_LIMIT
-  );
-  results.musicBrainzChecks = { checkedThisRun: mbCheckArtists.length, group: mbGroup + 1, totalGroups: mbTotalGroups };
-  for (const artist of mbCheckArtists) {
-    try {
-      const release = await getLatestReleaseFromMusicBrainz(artist.name);
-      if (release) musicBrainzCache.set(artist.id, release);
-    } catch (e) {
-      results.errors.push(`MusicBrainz: ${e.message}`);
+  const kworbCache = new Map();
+  const isMorningRun = now.getUTCHours() < 12;
+  if (isMorningRun) {
+    const MUSICBRAINZ_CHECK_LIMIT = 4;
+    const mbCandidates = artists.filter((a) => !spotifyCheckedThisRun.has(a.id));
+    const mbTotalGroups = Math.max(1, Math.ceil(mbCandidates.length / MUSICBRAINZ_CHECK_LIMIT));
+    const mbRunIndex = Math.floor(now.getTime() / (24 * 60 * 60 * 1000)); // once/day now, not once/cycle
+    const mbGroup = mbRunIndex % mbTotalGroups;
+    const mbCheckArtists = mbCandidates.slice(
+      mbGroup * MUSICBRAINZ_CHECK_LIMIT,
+      (mbGroup + 1) * MUSICBRAINZ_CHECK_LIMIT
+    );
+    results.musicBrainzChecks = { checkedThisRun: mbCheckArtists.length, group: mbGroup + 1, totalGroups: mbTotalGroups };
+    for (const artist of mbCheckArtists) {
+      try {
+        const release = await getLatestReleaseFromMusicBrainz(artist.name);
+        if (release) musicBrainzCache.set(artist.id, release);
+      } catch (e) {
+        results.errors.push(`MusicBrainz: ${e.message}`);
+      }
+      await sleep(1100); // hard limit is 1/sec — 1100ms leaves real margin
     }
-    await sleep(1100); // hard limit is 1/sec — 1100ms leaves real margin
   }
 
   // --- kworb.net pre-fetch (real per-song stream counts) ---
-  // Only for artists we already have a real Spotify ID for — kworb's URLs
-  // are keyed by that same ID, verified working directly against a real
-  // page before this shipped. No stated rate limit, but scraping 100
-  // individual pages every run is still worth pacing politely, so this
-  // reuses the same rotation pattern as everything else rather than
-  // hammering all of them at once.
-  const kworbCache = new Map();
-  const KWORB_CHECK_LIMIT = 40;
-  const kworbArtists = artists.filter((a) => a.spotify_id);
-  const kworbTotalGroups = Math.max(1, Math.ceil(kworbArtists.length / KWORB_CHECK_LIMIT));
-  const kworbRunIndex = Math.floor(now.getTime() / (12 * 60 * 60 * 1000));
-  const kworbGroup = kworbRunIndex % kworbTotalGroups;
-  const kworbCheckArtists = kworbArtists.slice(
-    kworbGroup * KWORB_CHECK_LIMIT,
-    (kworbGroup + 1) * KWORB_CHECK_LIMIT
-  );
-  results.kworbChecks = { checkedThisRun: kworbCheckArtists.length, group: kworbGroup + 1, totalGroups: kworbTotalGroups };
-  await processInBatches(kworbCheckArtists, 5, async (artist) => {
-    try {
-      const topTrack = await getKworbTopTrack(artist.spotify_id);
-      if (topTrack) kworbCache.set(artist.id, topTrack);
-    } catch (e) {
-      results.errors.push(`kworb: ${e.message}`);
-    }
-  }, 300);
+  // Same incident, same fix: morning-only, and a smaller batch. Their
+  // robots.txt allows automated access with no stated rate limit, but
+  // scraping 40 individual HTML pages every single cycle was real,
+  // avoidable wall-clock cost that contributed to the timeout above.
+  if (isMorningRun) {
+    const KWORB_CHECK_LIMIT = 15;
+    const kworbArtists = artists.filter((a) => a.spotify_id);
+    const kworbTotalGroups = Math.max(1, Math.ceil(kworbArtists.length / KWORB_CHECK_LIMIT));
+    const kworbRunIndex = Math.floor(now.getTime() / (24 * 60 * 60 * 1000));
+    const kworbGroup = kworbRunIndex % kworbTotalGroups;
+    const kworbCheckArtists = kworbArtists.slice(
+      kworbGroup * KWORB_CHECK_LIMIT,
+      (kworbGroup + 1) * KWORB_CHECK_LIMIT
+    );
+    results.kworbChecks = { checkedThisRun: kworbCheckArtists.length, group: kworbGroup + 1, totalGroups: kworbTotalGroups };
+    await processInBatches(kworbCheckArtists, 5, async (artist) => {
+      try {
+        const topTrack = await getKworbTopTrack(artist.spotify_id);
+        if (topTrack) kworbCache.set(artist.id, topTrack);
+      } catch (e) {
+        results.errors.push(`kworb: ${e.message}`);
+      }
+    }, 300);
+  }
 
   // --- YouTube pre-fetch — same bulk-call fix ---
   // Upcoming-premiere detection (search.list) has no bulk equivalent and

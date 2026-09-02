@@ -35,10 +35,28 @@ export default function SyncHealthCard({ runs }) {
     <div className="bg-[var(--surface)] border border-[var(--border)] rounded-2xl p-4">
       <div className="text-sm font-bold mb-1">🤖 Moteur de score</div>
       <div className={`text-base font-extrabold mb-1 ${headlineColor}`}>{headline}</div>
-      <div className="text-xs text-[var(--text-faint)] mb-4">
+      <div className="text-xs text-[var(--text-faint)] mb-1">
         Dernier passage : {formatWhen(last.started_at)} · {(last.duration_ms / 1000).toFixed(0)}s
         {last.errors?.length > 0 ? ` · ${last.errors.length} souci(s)` : " · aucun souci"}
       </div>
+
+      {/* A run killed by Netlify's ~60s hard limit shows EXACTLY 60000ms
+          and never gets the chance to log a real error — this happened
+          for real once already. Warning here at 45s means it's visible
+          the moment margin starts disappearing, not several confused
+          messages later trying to guess from a Netlify function log. */}
+      {last.duration_ms >= 45000 && (
+        <p className="text-[11px] text-[var(--crimson)] font-bold mb-3">
+          ⚠️ Ce cycle a pris {(last.duration_ms / 1000).toFixed(0)}s, proche de la limite de 60s —
+          risque réel d&apos;être coupé en plein milieu si ça continue à grimper.
+        </p>
+      )}
+      {last.duration_ms >= 59000 && (
+        <p className="text-[11px] text-[var(--crimson)] font-bold mb-3">
+          🔴 Ce cycle a probablement été interrompu de force par Netlify (durée ≈ 60s) — tout ce
+          qu&apos;il devait encore faire après ce point n&apos;a pas eu lieu.
+        </p>
+      )}
 
       {last.results?.releaseChecks && (
         <div className="text-[11px] text-[var(--text-faint)] mb-2">
