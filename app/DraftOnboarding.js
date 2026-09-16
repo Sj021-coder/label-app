@@ -16,7 +16,8 @@ import {
 const TIER_ORDER = ["S", "A", "B", "C"];
 
 // Build a valid roster (<=100M, <=7, at least one Tier B/C), optionally
-// starting from an existing selection. Powers "Complète pour moi" & "Équipe surprise".
+// starting from an existing selection. Powers "Complète pour moi" (step 1,
+// small, only once 3+ artists are already picked — see the fixed bottom bar).
 function buildRoster(pool, startIds = []) {
   const byId = Object.fromEntries(pool.map((a) => [a.id, a]));
   const selected = [...startIds];
@@ -41,12 +42,9 @@ function buildRoster(pool, startIds = []) {
 }
 
 export default function DraftOnboarding({ artists }) {
-  const [step, setStep] = useState(1); // 1 = pick artists, 2 = pseudo, 3 = email (optional)
+  const [step, setStep] = useState(1); // 1 = pick artists, 2 = pseudo (account created, done)
   const [selected, setSelected] = useState([]);
   const [username, setUsername] = useState("");
-  const [email, setEmail] = useState("");
-  const [emailSaved, setEmailSaved] = useState(false);
-  const [userId, setUserId] = useState(null); // set once the account exists
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
@@ -132,39 +130,11 @@ export default function DraftOnboarding({ artists }) {
     track(supabase, "account_created", {}, user.id);
     track(supabase, "roster_drafted", { size: selected.length, spent }, user.id);
 
-    // Account is DONE here. The next screen (email) is a pure OPTIONAL upsell —
-    // it never gates account creation, per the locked auth model.
-    setUserId(user.id);
-    setStep(3);
-  }
-
-  // Step 3: optionally link an email to the anonymous account for recovery /
-  // cross-device. Supabase upgrades the SAME user_id in place — no data lost.
-  async function handleAddEmail(e) {
-    e.preventDefault();
-    setError("");
-    setLoading(true);
-
-    const { error: updateError } = await supabase.auth.updateUser({
-      email: email.trim(),
-    });
-
-    setLoading(false);
-    if (updateError) {
-      setError(
-        updateError.message?.includes("registered")
-          ? "Cet email est déjà utilisé."
-          : "Impossible d'enregistrer cet email pour l'instant."
-      );
-      return;
-    }
-
-    track(supabase, "email_added", {}, userId);
-    setEmailSaved(true); // show the "check your inbox" confirmation, then continue
-  }
-
-  function finishOnboarding(skipped) {
-    if (skipped) track(supabase, "email_skipped", {}, userId);
+    // Account is DONE here — straight to the app, no extra screen after.
+    // The email-as-recovery upsell was a separate step here (2026-09); removed
+    // per the same reasoning that shaped step 1's shortcuts: don't add a screen
+    // after the conversion moment when there's nothing left to ask for. Email
+    // can still be offered later from Roster/Settings if that's wanted.
     router.push("/roster");
     router.refresh();
   }
@@ -264,26 +234,6 @@ export default function DraftOnboarding({ artists }) {
           </div>
         </div>
 
-        {/* Shortcuts: never a blank page */}
-        <div className="flex gap-2 mb-1.5">
-          <button
-            onClick={() => setSelected(buildRoster(artists, []))}
-            className="flex-1 bg-[var(--surface-2)] border border-[var(--border)] rounded-xl py-2.5 text-xs font-bold"
-          >
-            ✨ Équipe surprise
-          </button>
-          <button
-            onClick={() => setSelected((prev) => buildRoster(artists, prev))}
-            disabled={selected.length >= ROSTER_SIZE}
-            className="flex-1 bg-[var(--surface-2)] border border-[var(--border)] rounded-xl py-2.5 text-xs font-bold disabled:opacity-40"
-          >
-            🪄 Complète pour moi
-          </button>
-        </div>
-        <p className="text-center text-[10px] text-[var(--text-faint)] mb-3">
-          Un raccourci, pas un choix définitif — tu pourras tout changer après.
-        </p>
-
         {/* Search (always visible) */}
         <input
           type="text"
@@ -338,6 +288,18 @@ export default function DraftOnboarding({ artists }) {
 
         {/* Fixed continue bar */}
         <div className="fixed bottom-0 left-0 right-0 max-w-md mx-auto px-4 pb-5 pt-3 bg-gradient-to-t from-[var(--bg)] via-[var(--bg)] to-transparent">
+          {/* Only offered once he's committed (3+ picks) — at that point the
+              last few slots are real fatigue, not a way to skip the draft
+              entirely. Small and secondary on purpose: a kindness, not a CTA. */}
+          {selected.length >= 3 && selected.length < ROSTER_SIZE && (
+            <button
+              type="button"
+              onClick={() => setSelected((prev) => buildRoster(artists, prev))}
+              className="w-full text-center text-[11px] text-[var(--text-faint)] underline mb-2"
+            >
+              🪄 Complète les {ROSTER_SIZE - selected.length} restants pour moi
+            </button>
+          )}
           <button
             onClick={() => {
               track(supabase, "onboarding_pseudo_viewed", { size: selected.length });
@@ -346,7 +308,11 @@ export default function DraftOnboarding({ artists }) {
             disabled={!canContinue}
             className="w-full bg-[var(--gold)] text-[#1a1310] font-extrabold uppercase tracking-wide text-sm rounded-xl py-3.5 disabled:opacity-40"
           >
-            Continuer ({selected.length} signé{selected.length > 1 ? "s" : ""})
+            {selected.length === 0
+              ? "Signe ton 1er artiste"
+              : selected.length >= ROSTER_SIZE
+              ? "Valider mon label"
+              : `Continuer (${selected.length}/${ROSTER_SIZE})`}
           </button>
           <p className="text-center text-[10px] text-[var(--text-faint)] mt-1.5">
             ✏️ Rien n&apos;est figé — tu peux transférer tes artistes plus tard.
@@ -399,68 +365,4 @@ export default function DraftOnboarding({ artists }) {
       </div>
     );
   }
-
-  // Step 3: OPTIONAL email — the account already exists, this only adds
-  // recovery + cross-device. Skipping is a first-class action, never a dead end.
-  return (
-    <div className="flex flex-col items-center justify-center min-h-screen px-6 text-center">
-      <div className="text-4xl mb-3">🔒</div>
-      <div className="display text-2xl mb-2 leading-tight">
-        Protège
-        <br />
-        <span className="text-[var(--gold)]">ton label.</span>
-      </div>
-
-      {emailSaved ? (
-        <>
-          <p className="text-[var(--text-muted)] text-sm mb-2 max-w-xs">
-            On t&apos;a envoyé un lien de confirmation. Clique dessus quand tu veux — ton
-            label est déjà sauvegardé.
-          </p>
-          <button
-            onClick={() => finishOnboarding(false)}
-            className="w-full max-w-xs bg-[var(--gold)] text-[#1a1310] font-extrabold uppercase tracking-wide text-sm rounded-xl py-3 mt-5"
-          >
-            C&apos;est parti →
-          </button>
-        </>
-      ) : (
-        <>
-          <p className="text-[var(--text-muted)] text-sm mb-1.5 max-w-xs">
-            Ajoute un email pour retrouver ton label si tu changes de téléphone ou vides
-            ton navigateur.
-          </p>
-          <p className="text-[var(--text-faint)] text-xs mb-7 max-w-xs">
-            Aucun spam. Juste pour récupérer ton compte — {username || "ton pseudo"} reste
-            le même.
-          </p>
-          <form onSubmit={handleAddEmail} className="w-full max-w-xs space-y-3">
-            <input
-              type="email"
-              required
-              placeholder="ton@email.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              className="w-full text-center bg-[var(--surface)] border border-[var(--border)] rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[var(--gold)]"
-            />
-            {error && <p className="text-[var(--crimson)] text-xs">{error}</p>}
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full bg-[var(--gold)] text-[#1a1310] font-extrabold uppercase tracking-wide text-sm rounded-xl py-3 disabled:opacity-60"
-            >
-              {loading ? "..." : "Sauvegarder mon label"}
-            </button>
-            <button
-              type="button"
-              onClick={() => finishOnboarding(true)}
-              className="w-full text-xs text-[var(--text-faint)] underline py-1"
-            >
-              Plus tard — accéder à mon label
-            </button>
-          </form>
-        </>
-      )}
-    </div>
-  );
 }
