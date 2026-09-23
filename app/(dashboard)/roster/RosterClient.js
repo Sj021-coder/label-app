@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { TIERS } from "@/lib/gameRules";
 import { createClient } from "@/lib/supabase/client";
+import { getWeeklyProgram } from "@/lib/weeklyProgram";
 
 export default function RosterClient({
   roster,
@@ -34,6 +35,19 @@ export default function RosterClient({
   const flashSeq = useRef(0);
 
   const liveRoster = roster.map((a) => (liveOverrides[a.id] ? { ...a, ...liveOverrides[a.id] } : a));
+
+  // Fogg/Atomic Habits: reduce the captain choice to a single tap with a
+  // sensible default, instead of asking the user to scan 7 cards and decide
+  // from scratch every week. Computed client-side only (avoids an SSR/CSR
+  // time-of-day mismatch, same reasoning as the tick effect below).
+  const [teamWindowOpen, setTeamWindowOpen] = useState(false);
+  useEffect(() => {
+    setTeamWindowOpen(getWeeklyProgram().phase === "team");
+  }, []);
+  const suggestedCaptain = liveRoster.reduce(
+    (max, a) => ((a.score ?? 0) > (max?.score ?? -Infinity) ? a : max),
+    null
+  );
 
   useEffect(() => {
     const rosterIds = roster.map((a) => a.id);
@@ -93,6 +107,25 @@ export default function RosterClient({
           <span className="text-[11px] text-[var(--crimson)]">Règle diversité non respectée</span>
         )}
       </div>
+
+      {/* 1-tap default, only while it's actually actionable and there's a
+          real suggestion worth making (not already captain). */}
+      {teamWindowOpen && suggestedCaptain && suggestedCaptain.id !== captainArtistId && (
+        <div className="flex items-center justify-between gap-2 bg-[var(--gold-soft)] border border-[var(--gold)] rounded-xl px-3.5 py-2.5 mb-3">
+          <div className="text-xs min-w-0">
+            <span className="font-bold text-[var(--gold)]">🧢 Ton meilleur talent —</span>{" "}
+            <span className="font-bold">{suggestedCaptain.name}</span>
+            <span className="text-[var(--text-faint)]"> ({suggestedCaptain.score} pts)</span>
+          </div>
+          <button
+            onClick={() => setCaptain(suggestedCaptain.id)}
+            disabled={loadingId === suggestedCaptain.id}
+            className="flex-shrink-0 text-[11px] font-bold bg-[var(--gold)] text-[#1a1310] rounded-full px-3 py-1.5 disabled:opacity-60"
+          >
+            {loadingId === suggestedCaptain.id ? "…" : "Nommer capitaine"}
+          </button>
+        </div>
+      )}
 
       <Link
         href="/duel"

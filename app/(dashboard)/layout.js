@@ -4,7 +4,8 @@ import NavTabs from "@/components/NavTabs";
 import WeeklyBanner from "@/components/WeeklyBanner";
 import SignOutButton from "@/components/SignOutButton";
 import NotificationPrompt from "@/components/NotificationPrompt";
-import { getBilanWindow } from "@/lib/weeklyProgram";
+import { getBilanWindow, getWeeklyProgram } from "@/lib/weeklyProgram";
+import { getWeeklyFact } from "@/lib/weeklyFact";
 
 export default async function DashboardLayout({ children }) {
   const supabase = await createClient();
@@ -21,10 +22,12 @@ export default async function DashboardLayout({ children }) {
   if (!profile) redirect("/");
 
   const bilanReady = getBilanWindow(profile.created_at).ready;
+  const weeklyPhase = getWeeklyProgram().phase;
 
-  const [{ data: totals }, { data: activeSeason }] = await Promise.all([
+  const [{ data: totals }, { data: activeSeason }, weeklyFact] = await Promise.all([
     supabase.from("user_totals").select("*").eq("user_id", user.id).single(),
     supabase.from("seasons").select("name").eq("is_active", true).single(),
+    getWeeklyFact(supabase, user.id, weeklyPhase),
   ]);
 
   return (
@@ -46,7 +49,7 @@ export default async function DashboardLayout({ children }) {
           Saison : {activeSeason.name}
         </div>
       )}
-      <WeeklyBanner bilanReady={bilanReady} />
+      <WeeklyBanner bilanReady={bilanReady} fact={weeklyFact} />
       <NotificationPrompt />
       <NavTabs isAdmin={!!profile.is_admin} />
       <div className="px-4 pb-10">{children}</div>
