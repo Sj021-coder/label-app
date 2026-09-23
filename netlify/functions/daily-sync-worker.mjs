@@ -41,6 +41,8 @@
 import { createClient } from "@supabase/supabase-js";
 import { TRANSFER_FREE_PER_WEEK, TRANSFER_BANK_CAP } from "../../lib/gameRules.js";
 import { extractSignal, suggestScoring } from "../../lib/signals/extractSignal.js";
+import { getWeeklyFact } from "../../lib/weeklyFact.js";
+import { sendPushToUser } from "../../lib/push/send.js";
 
 async function getSpotifyToken() {
   const res = await fetch("https://accounts.spotify.com/api/token", {
@@ -1326,6 +1328,51 @@ export default async (req) => {
     }
   } catch (e) {
     results.errors.push(`weekly award: ${e.message}`);
+  }
+
+  // --- Weekly window notifications ---
+  // Fires exactly when a communal window opens — team (Mon 8h UTC) or
+  // predictions (Thu 8h UTC) — because this run's own day/hour already
+  // matches those exact moments (see lib/weeklyProgram.js), no separate
+  // schedule needed. Same identity-language headline + real fact as
+  // WeeklyBanner (lib/weeklyFact.js) — one source of truth for the copy,
+  // whether it's read on the page or pushed to a phone.
+  // Isolated in its own try/catch on purpose: a failure here (a bad push
+  // subscription, a transient error) must never affect a score, an event,
+  // or anything else already written this run.
+  try {
+    const isMorningRun8h = now.getUTCHours() < 12; // this file's own AM run, not the 20h one
+    const dayOfWeek = now.getUTCDay(); // 1 = Monday, 4 = Thursday
+    const windowPhase =
+      dayOfWeek === 1 && isMorningRun8h ? "team" : dayOfWeek === 4 && isMorningRun8h ? "predictions" : null;
+
+    if (windowPhase) {
+      const HEADLINE = {
+        team: "🧢 Aux commandes de ton label",
+        predictions: "🔮 Le pari du patron",
+      };
+      const url = windowPhase === "team" ? "/roster" : "/pickem";
+
+      const { data: subRows } = await supabase.from("push_subscriptions").select("user_id");
+      const userIds = [...new Set((subRows || []).map((r) => r.user_id))];
+
+      let notified = 0;
+      await Promise.all(
+        userIds.map(async (userId) => {
+          try {
+            const fact = await getWeeklyFact(supabase, userId, windowPhase);
+            const body = fact ? `${HEADLINE[windowPhase]} — ${fact}` : HEADLINE[windowPhase];
+            const { sent } = await sendPushToUser(userId, { title: "LABEL.", body, url });
+            if (sent > 0) notified++;
+          } catch {
+            // one user's bad/expired subscription must never block the others
+          }
+        })
+      );
+      results.weeklyWindowNotifications = { phase: windowPhase, notified, totalSubscribed: userIds.length };
+    }
+  } catch (e) {
+    results.errors.push(`weekly window notifications: ${e.message}`);
   }
 
     console.log("Daily sync complete:", JSON.stringify(results));
