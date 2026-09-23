@@ -6,6 +6,7 @@ import SignOutButton from "@/components/SignOutButton";
 import NotificationPrompt from "@/components/NotificationPrompt";
 import { getBilanWindow, getWeeklyProgram } from "@/lib/weeklyProgram";
 import { getWeeklyFact } from "@/lib/weeklyFact";
+import { getAdminContext } from "@/lib/supabase/admin";
 
 export default async function DashboardLayout({ children }) {
   const supabase = await createClient();
@@ -24,10 +25,11 @@ export default async function DashboardLayout({ children }) {
   const bilanReady = getBilanWindow(profile.created_at).ready;
   const weeklyPhase = getWeeklyProgram().phase;
 
-  const [{ data: totals }, { data: activeSeason }, weeklyFact] = await Promise.all([
+  const [{ data: totals }, { data: activeSeason }, weeklyFact, { isAdmin }] = await Promise.all([
     supabase.from("user_totals").select("*").eq("user_id", user.id).single(),
     supabase.from("seasons").select("name").eq("is_active", true).single(),
     getWeeklyFact(supabase, user.id, weeklyPhase),
+    getAdminContext(), // same isAdmin logic (DB flag OR unlocked code) everywhere, one source of truth
   ]);
 
   return (
@@ -51,7 +53,7 @@ export default async function DashboardLayout({ children }) {
       )}
       <WeeklyBanner bilanReady={bilanReady} fact={weeklyFact} />
       <NotificationPrompt />
-      <NavTabs isAdmin={!!profile.is_admin} />
+      <NavTabs isAdmin={isAdmin} />
       <div className="px-4 pb-10">{children}</div>
     </div>
   );

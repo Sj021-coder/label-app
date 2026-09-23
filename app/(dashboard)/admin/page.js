@@ -7,6 +7,7 @@ import AdminMapping from "./AdminMapping";
 import MetricsPanel from "./MetricsPanel";
 import SyncHealthCard from "./SyncHealthCard";
 import AdminPushTest from "./AdminPushTest";
+import AdminCodeGate from "./AdminCodeGate";
 
 export default async function AdminPage() {
   // 🔒 Admin gate: only a profile with is_admin = true may see this page.
@@ -25,6 +26,7 @@ export default async function AdminPage() {
           Rien n&apos;est cassé ! Elle n&apos;est simplement pas nécessaire pour
           jouer. Ton label et ton classement sont dans les autres onglets.
         </p>
+        <AdminCodeGate />
         <Link
           href="/roster"
           className="bg-[var(--gold)] text-[#1a1310] font-extrabold uppercase tracking-wide text-sm rounded-xl py-3 px-6"
